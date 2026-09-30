@@ -1,110 +1,145 @@
 #!/usr/bin/env bash
 
-ENGINE=mariadb-physical
+ENGINE=mariadb
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 # shellcheck source=lib/common.bash
 source "$SCRIPT_DIR/lib/common.bash"
 
-
 config_file=${1:-"$SCRIPT_DIR/.env"}
 
 [[ $# -le 1 ]] \
     || die "Cara pakai: $0 [/absolute/path/.env]"
 
-
 load_config "$config_file"
 
 
-#
-# Physical backup selalu mencakup seluruh
-# instance MariaDB, bukan satu database.
-#
-: "${MARIADB_PHYSICAL_USER:=${MARIADB_USER:-}}"
-: "${MARIADB_PHYSICAL_PASSWORD:=${MARIADB_PASSWORD:-}}"
-
-: "${MARIADB_PHYSICAL_SOCKET:=${MARIADB_SOCKET:-/run/mysqld/mysqld.sock}}"
-
-: "${MARIADB_PHYSICAL_BACKUP_NAME:=mariadb-full}"
-
-: "${MARIABACKUP_PARALLEL:=1}"
-
-: "${ZSTD_LEVEL:=3}"
-: "${ZSTD_THREADS:=1}"
+for command in \
+    mariadb \
+    mariadb-dump \
+    gzip \
+    grep \
+    sort \
+    head
+do
+    need "$command"
+done
 
 
-required MARIADB_PHYSICAL_USER
-required MARIADB_PHYSICAL_PASSWORD
+required MARIADB_USER
+required MARIADB_PASSWORD
+required MARIADB_DATABASES
 
 
-set_backup_name "$MARIADB_PHYSICAL_BACKUP_NAME"
+: "${MARIADB_HOST:=127.0.0.1}"
+: "${MARIADB_PORT:=3306}"
+: "${MARIADB_SOCKET:=}"
+
+: "${MARIADB_BACKUP_NAME:=mariadb-logical}"
+
+: "${MARIADB_SKIP_OBJECT_ERRORS:=true}"
 
 
-#
-# Validasi config.
-#
-[[ $MARIADB_PHYSICAL_SOCKET == /* ]] \
-    || die "MARIADB_PHYSICAL_SOCKET harus absolute path"
+set_backup_name "$MARIADB_BACKUP_NAME"
+
+unset MYSQL_PWD
 
 
-[[ $MARIABACKUP_PARALLEL =~ ^[1-9][0-9]*$ \
-   && $MARIABACKUP_PARALLEL -le 64 ]] \
-    || die "MARIABACKUP_PARALLEL harus 1-64"
+[[ $MARIADB_PORT =~ ^[1-9][0-9]*$ \
+   && $MARIADB_PORT -le 65535 ]] \
+    || die "MARIADB_PORT tidak valid"
 
 
-[[ $ZSTD_LEVEL =~ ^([1-9]|1[0-9])$ ]] \
-    || die "ZSTD_LEVEL harus 1-19"
+bool_value "$MARIADB_SKIP_OBJECT_ERRORS" || {
+    rc=$?
+
+    (( rc == 1 )) \
+        || die "MARIADB_SKIP_OBJECT_ERRORS harus true/false"
+}
 
 
-[[ $ZSTD_THREADS =~ ^[1-9][0-9]*$ \
-   && $ZSTD_THREADS -le 64 ]] \
-    || die "ZSTD_THREADS harus 1-64"
+IFS=',' read -r -a databases \
+    <<<"$MARIADB_DATABASES"
 
 
-need zstd
-need tee
+(( ${#databases[@]} > 0 )) \
+    || die "MARIADB_DATABASES tidak boleh kosong"
 
 
-#
-# Cari binary MariaDB Backup.
-#
-if command -v mariadb-backup >/dev/null 2>&1; then
+sql_list=''
 
-    backup_bin=mariadb-backup
 
-elif command -v mariabackup >/dev/null 2>&1; then
+for i in "${!databases[@]}"; do
 
-    backup_bin=mariabackup
+    db=${databases[$i]}
 
-else
+    # Buang spasi awal/akhir.
+    db="${db#"${db%%[![:space:]]*}"}"
+    db="${db%"${db##*[![:space:]]}"}"
 
-    die "Command mariadb-backup/mariabackup tidak ditemukan"
-fi
+    [[ $db =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] \
+        || die "Nama database tidak didukung: $db"
+
+    databases[$i]=$db
+
+    sql_list+="'$db',"
+done
+
+
+sql_list=${sql_list%,}
 
 
 begin_backup
 
 
-#
-# Credential sementara.
-#
-defaults_file="$RUN_DIR/mariadb-backup.cnf"
+# ============================================================
+# MARIADB CREDENTIAL
+# ============================================================
+
+defaults_file="$RUN_DIR/mariadb.cnf"
 
 TEMP_CREDENTIAL_FILE=$defaults_file
 
 
 {
-    printf '[mariadb-backup]\n'
+    printf '[client]\n'
 
     printf 'user="%s"\n' \
-        "$(escape_quoted_value "$MARIADB_PHYSICAL_USER")"
+        "$(escape_quoted_value "$MARIADB_USER")"
 
     printf 'password="%s"\n' \
-        "$(escape_quoted_value "$MARIADB_PHYSICAL_PASSWORD")"
+        "$(escape_quoted_value "$MARIADB_PASSWORD")"
 
-    printf 'socket="%s"\n' \
-        "$(escape_quoted_value "$MARIADB_PHYSICAL_SOCKET")"
+
+    if [[ -n $MARIADB_SOCKET ]]; then
+
+        [[ $MARIADB_SOCKET == /* ]] \
+            || die "MARIADB_SOCKET harus absolute path"
+
+        printf 'socket="%s"\n' \
+            "$(escape_quoted_value "$MARIADB_SOCKET")"
+
+    else
+
+        printf 'host="%s"\n' \
+            "$(escape_quoted_value "$MARIADB_HOST")"
+
+        printf 'port=%s\nprotocol=TCP\n' \
+            "$MARIADB_PORT"
+
+
+        if [[ -n ${MARIADB_SSL_CA:-} ]]; then
+
+            [[ $MARIADB_SSL_CA == /* \
+               && -f $MARIADB_SSL_CA \
+               && ! -L $MARIADB_SSL_CA ]] \
+                || die "MARIADB_SSL_CA tidak valid"
+
+            printf 'ssl-ca="%s"\nssl=1\nssl-verify-server-cert=1\n' \
+                "$(escape_quoted_value "$MARIADB_SSL_CA")"
+        fi
+    fi
 
 } >"$defaults_file"
 
@@ -112,53 +147,103 @@ TEMP_CREDENTIAL_FILE=$defaults_file
 chmod 600 "$defaults_file"
 
 
-#
-# File hasil.
-#
-artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.xbstream.zst"
+conn=(
+    --defaults-file="$defaults_file"
+)
 
 
-#
-# Log khusus mariadb-backup.
-#
-backup_log="$LOG_DIR/mariadb-physical-${STAMP}.log"
+# ============================================================
+# PREFLIGHT CONNECTION
+# ============================================================
 
-: >"$backup_log"
-
-chmod 600 "$backup_log"
-
-
-log "Full physical backup seluruh instance MariaDB"
-
-log "Stream: mariadb-backup -> zstd -> $artifact"
+run_backup \
+    mariadb \
+    "${conn[@]}" \
+    --batch \
+    --skip-column-names \
+    --execute='SELECT 1' \
+    >/dev/null
 
 
-#
-# PENTING:
-#
-# stdout mariadb-backup = binary xbstream
-#
-# stdout tersebut HANYA diarahkan ke zstd.
-#
-# stderr mariadb-backup = log text
-# diarahkan ke log + terminal.
-#
+# ============================================================
+# CHECK NON-INNODB
+# ============================================================
+
+non_innodb=$(
+    run_backup \
+        mariadb \
+        "${conn[@]}" \
+        --batch \
+        --skip-column-names \
+        --execute="SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA IN ($sql_list) AND TABLE_TYPE='BASE TABLE' AND ENGINE <> 'InnoDB'"
+)
+
+
+if [[ $non_innodb != 0 ]]; then
+
+    mark_warning \
+        "Ditemukan $non_innodb tabel non-InnoDB. Backup tetap lanjut, tetapi --single-transaction tidak menjamin snapshot konsisten untuk tabel tersebut."
+fi
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
+artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.sql.gz"
+
+dump_log="$LOG_DIR/mariadb-dump-${STAMP}.log"
+
+
+: >"$dump_log"
+
+chmod 600 "$dump_log"
+
+
+args=(
+    "${conn[@]}"
+
+    --single-transaction
+    --quick
+    --skip-lock-tables
+
+    --routines
+    --events
+    --triggers
+
+    --hex-blob
+    --tz-utc
+    --no-tablespaces
+)
+
+
+if bool_value "$MARIADB_SKIP_OBJECT_ERRORS"; then
+
+    # Kalau satu view/table bermasalah,
+    # mariadb-dump tetap lanjut.
+    args+=(--force)
+fi
+
+
+log "Dump database: ${databases[*]}"
+
+
+# ============================================================
+# BACKUP
+# ============================================================
+
 set +e
 
 
 run_backup \
-    "$backup_bin" \
-    --defaults-extra-file="$defaults_file" \
-    --backup \
-    --stream=xbstream \
-    --parallel="$MARIABACKUP_PARALLEL" \
+    mariadb-dump \
+    "${args[@]}" \
+    --databases \
+    "${databases[@]}" \
     2> >(
-        tee -a "$backup_log" >&2
+        tee -a "$dump_log" >&2
     ) |
-    zstd \
-        --quiet \
-        "-T${ZSTD_THREADS}" \
-        "-${ZSTD_LEVEL}" \
+    gzip -6 \
         >"$artifact"
 
 
@@ -170,58 +255,143 @@ pipe_rc=(
 set -e
 
 
-backup_rc=${pipe_rc[0]:-1}
+dump_rc=${pipe_rc[0]:-1}
 
-zstd_rc=${pipe_rc[1]:-1}
-
-
-#
-# Validasi mariadb-backup.
-#
-if (( backup_rc != 0 )); then
-
-    die "MariaDB physical backup gagal (rc=$backup_rc). Lihat log: $backup_log"
-fi
+gzip_rc=${pipe_rc[1]:-1}
 
 
-#
-# Validasi compression.
-#
-if (( zstd_rc != 0 )); then
-
-    die "zstd gagal melakukan compression (rc=$zstd_rc). Lihat log: $backup_log"
-fi
+(( gzip_rc == 0 )) \
+    || die "gzip gagal saat membuat backup MariaDB (rc=$gzip_rc)"
 
 
-#
-# File tidak boleh kosong.
-#
-[[ -s $artifact ]] \
-    || die "Hasil MariaDB physical backup kosong"
+gzip -t "$artifact"
 
 
-log "Validasi file Zstandard"
+# ============================================================
+# FATAL ERROR CHECK
+# ============================================================
+
+fatal_regex='Access denied|Can.t connect|Could not connect|Lost connection|server has gone away|No space left|Disk full|write error|unknown option|when trying to connect|Connection refused|Connection timed out|TLS/SSL error'
 
 
-if ! zstd \
-    --test \
-    --quiet \
-    "$artifact"
+if [[ -s $dump_log ]] \
+   && grep -Eiq \
+        "$fatal_regex" \
+        "$dump_log"
 then
 
-    die "Validasi file physical backup gagal: $artifact"
+    die "mariadb-dump mengalami error koneksi/auth/storage. Lihat log: $dump_log"
 fi
 
 
-#
-# Catat ukuran local sebelum upload.
-#
-artifact_size=$(stat -c %s -- "$artifact")
+# ============================================================
+# DETECT SKIPPED / BROKEN OBJECTS
+# ============================================================
 
-log "Physical backup selesai: $(human_bytes "$artifact_size")"
+skipped_count=0
 
 
-#
-# Upload + checksum + verifikasi GCS.
-#
+if [[ -s $dump_log ]]; then
+
+    skipped_count=$(
+        grep -Ec \
+            "^mariadb-dump: Couldn't execute|^mysqldump: Couldn't execute" \
+            "$dump_log" \
+            || true
+    )
+fi
+
+
+if (( skipped_count > 0 )); then
+
+    while IFS= read -r skipped_object; do
+
+        [[ -n $skipped_object ]] \
+            || continue
+
+        mark_skipped_object \
+            "$skipped_object"
+
+    done < <(
+
+        {
+            # Object yang sedang didump.
+            # Contoh:
+            # SHOW FIELDS FROM `vw_ex_coal`
+            grep -E \
+                "^mariadb-dump: Couldn't execute|^mysqldump: Couldn't execute" \
+                "$dump_log" |
+                sed -n \
+                    's/.*SHOW FIELDS FROM `\([^`]*\)`.*/\1/p'
+
+
+            # View yang disebut sebagai sumber error.
+            # Contoh:
+            # View 'db_opr.vw_unit' references invalid...
+            grep -E \
+                "^mariadb-dump: Couldn't execute|^mysqldump: Couldn't execute" \
+                "$dump_log" |
+                sed -n \
+                    "s/.*View '\([^']*\)'.*/\1/p"
+
+        } |
+            sort -u |
+            head -n 20
+    )
+fi
+
+
+# ============================================================
+# RESULT HANDLING
+# ============================================================
+
+if (( dump_rc != 0 )); then
+
+    # Timeout / terminated tetap dianggap fatal.
+    if (( dump_rc == 124 \
+          || dump_rc == 137 \
+          || dump_rc == 143 ))
+    then
+
+        die "mariadb-dump timeout/terminated (rc=$dump_rc). Lihat log: $dump_log"
+    fi
+
+
+    # Broken object boleh diskip.
+    if bool_value "$MARIADB_SKIP_OBJECT_ERRORS" \
+       && (( skipped_count > 0 ))
+    then
+
+        mark_warning \
+            "mariadb-dump selesai dengan rc=$dump_rc; $skipped_count object/table/view bermasalah dilewati. Detail: $dump_log"
+
+    else
+
+        die "mariadb-dump gagal (rc=$dump_rc). Lihat log: $dump_log"
+    fi
+
+
+elif (( skipped_count > 0 )); then
+
+    mark_warning \
+        "$skipped_count object/table/view bermasalah dilewati oleh mariadb-dump --force. Detail: $dump_log"
+
+
+elif [[ -s $dump_log ]]; then
+
+    # Warning client non-fatal tetap disimpan.
+    mark_warning \
+        "mariadb-dump menghasilkan warning. Detail: $dump_log"
+
+
+else
+
+    rm -f -- "$dump_log"
+fi
+
+
+# ============================================================
+# GCS
+# ============================================================
+
 upload_backup "$artifact"
