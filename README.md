@@ -20,8 +20,11 @@ Setelah backup selesai, script otomatis:
 2. membuat SHA-256;
 3. upload file + `.sha256` ke GCS;
 4. memverifikasi size dan MD5 object di GCS;
-5. menghapus staging lokal bila sukses;
-6. mempertahankan staging lokal bila gagal agar bisa diperiksa.
+5. retry upload GCS bila terjadi kegagalan sementara;
+6. menghapus staging lokal bila sukses;
+7. mempertahankan staging lokal bila gagal agar bisa diperiksa;
+8. menyimpan log;
+9. mengirim ringkasan ke Discord/Telegram bila diaktifkan.
 
 ## 1. Setup cepat
 
@@ -213,7 +216,15 @@ Jika memakai TLS:
 MARIADB_SSL_CA='/etc/ssl/certs/mariadb-ca.pem'
 ```
 
-Logical backup memakai `--single-transaction` dan menolak tabel non-InnoDB supaya tidak memberi kesan backup konsisten padahal tidak.
+Logical backup memakai `--single-transaction`. Secara default `MARIADB_SKIP_OBJECT_ERRORS=true`, sehingga `mariadb-dump --force` akan melanjutkan ke object berikutnya bila satu table/view/object bermasalah. Error tetap dicatat di `LOG_DIR/mariadb-dump-TIMESTAMP.log` dan hasil `backup-all.sh` menjadi `WARNING`, bukan menghentikan seluruh backup.
+
+Contoh:
+
+```bash
+MARIADB_SKIP_OBJECT_ERRORS=true
+```
+
+Error fatal seperti gagal login, tidak dapat terhubung, koneksi putus, timeout, atau masalah storage tetap dianggap `FAILED`; error tersebut tidak disamarkan sebagai skip karena dapat menghasilkan backup parsial. Bila ada tabel non-InnoDB, backup tetap berjalan namun dicatat sebagai warning karena `--single-transaction` tidak menjamin konsistensi tabel non-InnoDB.
 
 ## 6. MariaDB physical
 
@@ -279,7 +290,57 @@ sudo crontab -l
 
 Untuk logical-only, Anda boleh memakai user OS khusus dengan permission minimum.
 
-## 9. Struktur object GCS
+
+## 9. Log dan notifikasi
+
+Default log disimpan di:
+
+```bash
+LOG_DIR="$SCRIPT_DIR/logs"
+```
+
+Jika menjalankan `backup-all.sh`, semua output MongoDB/MariaDB/PostgreSQL/GCS masuk ke satu log harian, misalnya:
+
+```text
+/opt/auto-backup/logs/backup-all-20260930.log
+```
+
+Khusus error/warning `mariadb-dump`, detail tambahan disimpan sebagai:
+
+```text
+/opt/auto-backup/logs/mariadb-dump-20260930T062830Z.log
+```
+
+### Discord
+
+Buat Incoming Webhook di Discord lalu isi:
+
+```bash
+NOTIFY_DISCORD=true
+DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/ID/TOKEN'
+```
+
+### Telegram
+
+Buat bot Telegram, lalu isi token bot dan chat ID:
+
+```bash
+NOTIFY_TELEGRAM=true
+TELEGRAM_BOT_TOKEN='123456789:AA...'
+TELEGRAM_CHAT_ID='123456789'
+```
+
+Atur kondisi pengiriman:
+
+```bash
+NOTIFY_ON_SUCCESS=true
+NOTIFY_ON_WARNING=true
+NOTIFY_ON_FAILURE=true
+```
+
+`backup-all.sh` mengirim **satu ringkasan** setelah seluruh job selesai. Status yang mungkin: `SUCCESS`, `WARNING`, atau `FAILED`. Warning MariaDB karena object yang dilewati akan ikut tercantum dalam notifikasi. Kegagalan mengirim notifikasi tidak mengubah backup yang sudah sukses menjadi gagal; kegagalan notifikasi tetap dicatat di log.
+
+## 10. Struktur object GCS
 
 Contoh:
 
@@ -293,7 +354,7 @@ gs://bucket/database-backups/postgresql/postgresql-app_database/
 Setiap folder berisi file backup dan file `.sha256`.
 Retention sebaiknya diatur dengan lifecycle policy pada bucket GCS, bukan dengan `rm` di server backup.
 
-## 10. Restore singkat
+## 11. Restore singkat
 
 MariaDB logical:
 
@@ -329,12 +390,12 @@ pg_restore --dbname=target_database --no-owner --no-acl --exit-on-error postgres
 
 Selalu uji restore ke environment terpisah sebelum menganggap backup siap untuk disaster recovery.
 
-## 11. Dependency
+## 12. Dependency
 
 Umum:
 
 ```text
-bash flock timeout sha256sum openssl base64 gcloud
+bash flock timeout sha256sum openssl base64 gcloud curl hostname tee
 ```
 
 MongoDB:
@@ -361,7 +422,7 @@ PostgreSQL:
 pg_dump pg_restore
 ```
 
-## 12. Validasi script
+## 13. Validasi script
 
 ```bash
 bash -n backup-all.sh backup-mongodb.sh backup-mariadb.sh \

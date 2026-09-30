@@ -1,9 +1,9 @@
-/var/log/db-backup/*.log {
-    weekly
-    rotate 12
+/opt/auto-backup/logs/*.log {
+    daily
+    rotate 30
     compress
+    delaycompress
     missingok
     notifempty
-    su dbbackup dbbackup
-    create 0600 dbbackup dbbackup
+    copytruncate
 }

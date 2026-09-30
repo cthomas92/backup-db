@@ -7,7 +7,7 @@ config_file=${1:-"$SCRIPT_DIR/.env"}
 [[ $# -le 1 ]] || die "Cara pakai: $0 [/absolute/path/.env]"
 load_config "$config_file"
 
-for command in mariadb mariadb-dump gzip; do need "$command"; done
+for command in mariadb mariadb-dump gzip grep; do need "$command"; done
 required MARIADB_USER
 required MARIADB_PASSWORD
 required MARIADB_DATABASES
@@ -15,11 +15,16 @@ required MARIADB_DATABASES
 : "${MARIADB_PORT:=3306}"
 : "${MARIADB_SOCKET:=}"
 : "${MARIADB_BACKUP_NAME:=mariadb-logical}"
+: "${MARIADB_SKIP_OBJECT_ERRORS:=true}"
 set_backup_name "$MARIADB_BACKUP_NAME"
 unset MYSQL_PWD
 
 [[ $MARIADB_PORT =~ ^[1-9][0-9]*$ && $MARIADB_PORT -le 65535 ]] \
     || die "MARIADB_PORT tidak valid"
+bool_value "$MARIADB_SKIP_OBJECT_ERRORS" || {
+    rc=$?
+    (( rc == 1 )) || die "MARIADB_SKIP_OBJECT_ERRORS harus true/false"
+}
 
 IFS=',' read -r -a databases <<<"$MARIADB_DATABASES"
 (( ${#databases[@]} > 0 )) || die "MARIADB_DATABASES tidak boleh kosong"
@@ -59,15 +64,67 @@ TEMP_CREDENTIAL_FILE=$defaults_file
 chmod 600 "$defaults_file"
 
 conn=(--defaults-file="$defaults_file")
+# Preflight: jangan sampai auth/koneksi gagal lalu menghasilkan dump parsial yang dianggap sehat.
+run_backup mariadb "${conn[@]}" --batch --skip-column-names --execute='SELECT 1' >/dev/null
+
 non_innodb=$(run_backup mariadb "${conn[@]}" --batch --skip-column-names \
     --execute="SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA IN ($sql_list) AND TABLE_TYPE='BASE TABLE' AND ENGINE <> 'InnoDB'")
-[[ $non_innodb == 0 ]] \
-    || die "Ditemukan tabel non-InnoDB; --single-transaction tidak dapat menjamin konsistensi"
+if [[ $non_innodb != 0 ]]; then
+    mark_warning "Ditemukan $non_innodb tabel non-InnoDB. Backup tetap lanjut, tetapi --single-transaction tidak menjamin snapshot konsisten untuk tabel tersebut."
+fi
 
 artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.sql.gz"
+dump_log="$LOG_DIR/mariadb-dump-${STAMP}.log"
+: >"$dump_log"
+chmod 600 "$dump_log"
+
 args=("${conn[@]}" --single-transaction --quick --skip-lock-tables --routines \
       --events --triggers --hex-blob --tz-utc --no-tablespaces)
+if bool_value "$MARIADB_SKIP_OBJECT_ERRORS"; then
+    # --force membuat mariadb-dump lanjut ke object berikutnya bila satu table/view error.
+    args+=(--force)
+fi
+
 log "Dump database: ${databases[*]}"
-run_backup mariadb-dump "${args[@]}" --databases "${databases[@]}" | gzip -6 >"$artifact"
+set +e
+run_backup mariadb-dump "${args[@]}" --databases "${databases[@]}" \
+    2> >(tee -a "$dump_log" >&2) | gzip -6 >"$artifact"
+pipe_rc=("${PIPESTATUS[@]}")
+set -e
+
+dump_rc=${pipe_rc[0]:-1}
+gzip_rc=${pipe_rc[1]:-1}
+(( gzip_rc == 0 )) || die "gzip gagal saat membuat backup MariaDB (rc=$gzip_rc)"
 gzip -t "$artifact"
+
+# Error fatal tidak boleh ditutupi sebagai 'skip object', karena dapat membuat backup parsial.
+fatal_regex='Access denied|Can.t connect|Could not connect|Lost connection|server has gone away|No space left|Disk full|write error|unknown option|when trying to connect|Connection refused|Connection timed out|TLS/SSL error'
+if [[ -s $dump_log ]] && grep -Eiq "$fatal_regex" "$dump_log"; then
+    die "mariadb-dump mengalami error koneksi/auth/storage. Lihat log: $dump_log"
+fi
+
+skipped_count=0
+if [[ -s $dump_log ]]; then
+    skipped_count=$(grep -Ec "^mariadb-dump: Couldn't execute|^mysqldump: Couldn't execute" "$dump_log" || true)
+fi
+
+if (( dump_rc != 0 )); then
+    # timeout/termination selalu fatal.
+    if (( dump_rc == 124 || dump_rc == 137 || dump_rc == 143 )); then
+        die "mariadb-dump timeout/terminated (rc=$dump_rc). Lihat log: $dump_log"
+    fi
+    if bool_value "$MARIADB_SKIP_OBJECT_ERRORS" && (( skipped_count > 0 )); then
+        mark_warning "mariadb-dump selesai dengan rc=$dump_rc; $skipped_count object/table/view bermasalah dilewati. Detail: $dump_log"
+    else
+        die "mariadb-dump gagal (rc=$dump_rc). Lihat log: $dump_log"
+    fi
+elif (( skipped_count > 0 )); then
+    mark_warning "$skipped_count object/table/view bermasalah dilewati oleh mariadb-dump --force. Detail: $dump_log"
+elif [[ -s $dump_log ]]; then
+    # Warning non-fatal dari client tetap disimpan agar mudah audit.
+    mark_warning "mariadb-dump menghasilkan warning. Detail: $dump_log"
+else
+    rm -f -- "$dump_log"
+fi
+
 upload_backup "$artifact"
