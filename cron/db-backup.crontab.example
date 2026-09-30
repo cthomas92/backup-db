@@ -1,0 +1,8 @@
+SHELL=/bin/bash
+HOME=/var/lib/db-backup
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=ops@example.com
+
+15 1 * * * /opt/db-backup/backup-mongodb.sh /etc/db-backup/mongodb.conf >>/var/log/db-backup/mongodb.log 2>&1
+15 2 * * * /opt/db-backup/backup-mariadb.sh /etc/db-backup/mariadb.conf >>/var/log/db-backup/mariadb.log 2>&1
+15 3 * * * /opt/db-backup/backup-postgresql.sh /etc/db-backup/postgresql-app.conf >>/var/log/db-backup/postgresql-app.log 2>&1

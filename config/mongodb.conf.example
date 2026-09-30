@@ -1,0 +1,12 @@
+# Folder tujuan di GCS. Hasil akhir ditambah /mongodb/BACKUP_NAME/ secara otomatis.
+GCS_URI='gs://REPLACE_BUCKET/database-backups'
+BACKUP_NAME='production-mongodb'
+# Folder sementara di mesin database, bukan folder GCS.
+BACKUP_DIR='/var/lib/db-backup'
+
+MONGO_CONFIG_FILE='/etc/db-backup/mongodb.yml'
+MONGO_MODE='replica-set'
+
+# Hanya untuk MongoDB standalone: hentikan seluruh write selama proses backup.
+# MONGO_MODE='standalone'
+# MONGO_WRITES_PAUSED=true

@@ -1,0 +1,8 @@
+# Folder tujuan di GCS. Hasil akhir ditambah /mariadb/BACKUP_NAME/ secara otomatis.
+GCS_URI='gs://REPLACE_BUCKET/database-backups'
+BACKUP_NAME='production-mariadb'
+# Folder sementara di mesin database, bukan folder GCS.
+BACKUP_DIR='/var/lib/db-backup'
+
+MARIADB_DEFAULTS_FILE='/etc/db-backup/mariadb.cnf'
+MARIADB_DATABASES=('app_database' 'billing_database')

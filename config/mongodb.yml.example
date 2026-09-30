@@ -1,0 +1,6 @@
+# Gunakan user khusus dengan role backup bawaan tanpa role tambahan; chmod 600.
+# mongodump/mongorestore YAML. Do not include a database after /.
+# URI credentials must be percent-encoded if placed in the URI. Prefer password below.
+uri: "mongodb://backup_user@mongo1.example.com:27017,mongo2.example.com:27017/?replicaSet=rs0&authSource=admin&tls=true"
+password: "REPLACE_PASSWORD"
+# For a private CA, install its CA in the host trust store used by the tools.

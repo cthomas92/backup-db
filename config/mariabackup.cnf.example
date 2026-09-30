@@ -1,0 +1,9 @@
+# File credential khusus mariabackup; owner OS mysql, chmod 600.
+[mariadb-backup]
+user=mariabackup
+password="REPLACE_PASSWORD"
+socket=/run/mysqld/mysqld.sock
+
+# mariadb-backup tetap membaca konfigurasi server global. Isi hanya bila datadir
+# server tidak dapat ditemukan dari konfigurasi tersebut.
+# datadir=/var/lib/mysql

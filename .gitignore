@@ -1,0 +1,13 @@
+*.conf
+*.cnf
+*.yml
+!*.example
+*.age
+*.tar
+*.gz
+*.dump
+*.zst
+*.xbstream
+*.log
+!dist/
+!dist/db-backup-tools.tar.gz

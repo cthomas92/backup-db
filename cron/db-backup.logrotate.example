@@ -1,0 +1,9 @@
+/var/log/db-backup/*.log {
+    weekly
+    rotate 12
+    compress
+    missingok
+    notifempty
+    su dbbackup dbbackup
+    create 0600 dbbackup dbbackup
+}

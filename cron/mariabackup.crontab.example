@@ -1,0 +1,8 @@
+# Install untuk OS user yang dapat membaca datadir, biasanya mysql:
+# sudo crontab -u mysql cron/mariabackup.crontab.example
+SHELL=/bin/bash
+HOME=/var/lib/mariadb-backup
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=ops@example.com
+
+30 0 * * * /opt/db-backup/backup-mariadb-physical.sh /etc/mariadb-backup/mariabackup.conf >>/var/log/mariadb-backup/backup.log 2>&1
