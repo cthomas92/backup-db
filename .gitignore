@@ -9,5 +9,9 @@
 *.zst
 *.xbstream
 *.log
+/.env
+/service-account.json
+/backups/
+/.gcloud/
 !dist/
 !dist/db-backup-tools.tar.gz

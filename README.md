@@ -1,368 +1,369 @@
-# Backup database ke Google Cloud Storage
+# Auto Backup Database ke Google Cloud Storage
 
-Project ini sengaja sederhana. Ada empat perintah backup:
+Versi ini dibuat supaya konfigurasi sesederhana mungkin: **semua script memakai satu `.env`**.
+Tidak perlu membuat file `.conf`, `.cnf`, `.pgpass`, atau file credential database secara manual.
+File credential sementara dibuat otomatis dengan permission `600`, lalu dihapus setelah proses selesai.
 
-| Script | File hasil | Restore |
+Backup yang tersedia:
+
+| Script | Fungsi | Hasil |
 | --- | --- | --- |
-| `backup-mongodb.sh` | `.archive.gz` | `mongorestore` |
-| `backup-mariadb.sh` | `.sql.gz` | `mariadb` |
-| `backup-mariadb-physical.sh` | `.xbstream.zst` | `mbstream` + `mariadb-backup` |
-| `backup-postgresql.sh` | `.dump` | `pg_restore` |
+| `backup-mongodb.sh` | MongoDB: semua DB, satu DB, atau satu collection | `.archive.gz` |
+| `backup-mariadb.sh` | MariaDB logical: satu / beberapa DB | `.sql.gz` |
+| `backup-mariadb-physical.sh` | MariaDB physical: seluruh instance | `.xbstream.zst` |
+| `backup-postgresql.sh` | PostgreSQL: satu DB | `.dump` |
+| `backup-all.sh` | Menjalankan semua backup yang diaktifkan di `.env` | sesuai script |
 
-Setiap script melakukan dump, memeriksa hasil, membuat SHA-256, lalu mengunggah
-file backup dan file `.sha256` ke GCS. Tidak ada Python, init gcloud, tar tambahan,
-manifest, atau service. `lib/common.bash` hanya berisi fungsi bersama agar empat
-script tidak mengulang kode upload, lock, dan cleanup.
+Setelah backup selesai, script otomatis:
 
-## Persyaratan
+1. memvalidasi file hasil backup;
+2. membuat SHA-256;
+3. upload file + `.sha256` ke GCS;
+4. memverifikasi size dan MD5 object di GCS;
+5. menghapus staging lokal bila sukses;
+6. mempertahankan staging lokal bila gagal agar bisa diperiksa.
 
-- Linux, Bash, `flock`, `timeout`, `sha256sum`, dan Google Cloud CLI (`gcloud`).
-- MongoDB Database Tools untuk MongoDB.
-- Client MariaDB (`mariadb` dan `mariadb-dump`) yang sesuai dengan server.
-- `mariabackup`/`mariadb-backup`, `mbstream`, dan `zstd` untuk physical backup.
-- Client PostgreSQL yang sesuai dengan server.
-- Bucket GCS private dan user/service account dengan izin `storage.objects.create`
-  dan `storage.objects.get` pada prefix tujuan.
+## 1. Setup cepat
 
-Google Cloud dan database harus sudah disiapkan oleh operator. Script tidak
-melakukan login, membuat bucket, membuat user database, atau menghapus backup lama.
-Atur retention/lifecycle langsung pada bucket GCS.
-
-Untuk MariaDB dan PostgreSQL, gunakan account khusus backup yang hanya
-memiliki izin baca dan metadata yang diperlukan tool dump. Jangan berikan hak DML,
-DDL, superuser, atau administrasi lain. Untuk MongoDB gunakan role `backup` bawaan
-yang direkomendasikan MongoDB dan jangan tambahkan role lain.
-
-## Instalasi
-
-Contoh memakai user OS khusus bernama `dbbackup`:
+Clone/copy folder ini, misalnya ke `/opt/auto-backup`:
 
 ```bash
-sudo useradd --system --create-home --home-dir /var/lib/db-backup \
-  --shell /usr/sbin/nologin dbbackup
-sudo install -d -o root -g root -m 755 /opt/db-backup /opt/db-backup/lib
-sudo install -m 755 backup-mongodb.sh backup-mariadb.sh \
-  backup-mariadb-physical.sh backup-postgresql.sh /opt/db-backup/
-sudo install -m 644 lib/common.bash /opt/db-backup/lib/
-sudo install -d -o dbbackup -g dbbackup -m 700 \
-  /etc/db-backup /var/lib/db-backup /var/log/db-backup
-sudo install -o dbbackup -g dbbackup -m 600 /dev/null \
-  /var/log/db-backup/mongodb.log
-sudo install -o dbbackup -g dbbackup -m 600 /dev/null \
-  /var/log/db-backup/mariadb.log
-sudo install -o dbbackup -g dbbackup -m 600 /dev/null \
-  /var/log/db-backup/postgresql-app.log
+sudo install -d -m 700 /opt/auto-backup
+sudo cp -a . /opt/auto-backup/
+cd /opt/auto-backup
+sudo cp .env.example .env
+sudo chmod 600 .env
+sudo mkdir -p backups
+sudo chmod 700 backups
 ```
 
-Script dapat dipindahkan ke mesin Linux lain. Salin empat script bersama direktori
-`lib`, instal client database dan `gcloud`, lalu buat config untuk mesin tersebut.
-
-## Setup gcloud
-
-Tidak perlu initialization di dalam script. Login satu kali sebagai user yang
-menjalankan cron, lalu periksa hasilnya:
+Edit hanya `.env`:
 
 ```bash
-sudo -H -u dbbackup gcloud auth list
-sudo -H -u dbbackup gcloud storage ls gs://NAMA_BUCKET
+sudo nano /opt/auto-backup/.env
 ```
 
-Attached service account pada VM adalah pilihan paling sederhana karena tidak
-memerlukan file JSON. Bila setup Anda memakai JSON key, tempat yang aman dan mudah
-dipahami adalah:
-
-```text
-/etc/db-backup/gcp-service-account.json
-owner: dbbackup
-mode: 600
-```
-
-Aktivasi dilakukan manual oleh Anda, bukan oleh script:
+Minimal isi:
 
 ```bash
-sudo install -o dbbackup -g dbbackup -m 600 /lokasi/key.json \
-  /etc/db-backup/gcp-service-account.json
-sudo -H -u dbbackup gcloud auth activate-service-account \
-  --key-file=/etc/db-backup/gcp-service-account.json
+GCS_URI='gs://nama-bucket/database-backups'
+
+MONGO_USER='backup_user'
+MONGO_PASSWORD='password'
+MONGO_DATABASE='nama_db'
+MONGO_COLLECTION=''
+
+MARIADB_USER='backup_user'
+MARIADB_PASSWORD='password'
+MARIADB_DATABASES='nama_db'
+
+POSTGRES_USER='backup_user'
+POSTGRES_PASSWORD='password'
+POSTGRES_DATABASE='nama_db'
 ```
 
-Jangan menaruh JSON key di crontab, source code, bucket backup, atau argument
-command. Kelola atau hapus file setup itu sesuai kebijakan key organisasi Anda;
-script backup tidak pernah membacanya.
-
-## Konfigurasi
-
-Salin contoh untuk database yang dipakai:
+Untuk physical MariaDB, backup selalu **seluruh instance**, bukan satu database:
 
 ```bash
-sudo install -o dbbackup -g dbbackup -m 600 \
-  config/mariadb.conf.example /etc/db-backup/mariadb.conf
-sudo install -o dbbackup -g dbbackup -m 600 \
-  config/mariadb.cnf.example /etc/db-backup/mariadb.cnf
+MARIADB_PHYSICAL_USER='mariabackup'
+MARIADB_PHYSICAL_PASSWORD='password'
+BACKUP_MARIADB_PHYSICAL=true
 ```
 
-Untuk MongoDB gunakan `mongodb.conf.example` dan `mongodb.yml.example`. Untuk
-PostgreSQL gunakan `postgresql.conf.example` dan `pgpass.example`. Semua file
-config/credential harus dimiliki `dbbackup`, mode `600`, dan menggunakan absolute
-path. Ganti seluruh nilai `REPLACE`.
+Jika `MARIADB_PHYSICAL_USER/PASSWORD` dikosongkan, script memakai `MARIADB_USER/PASSWORD`.
+Pastikan user tersebut memang memiliki privilege yang dibutuhkan `mariadb-backup`.
 
-Pengaturan yang sama pada semua config hanya tiga:
+## 2. Pilih backup yang aktif
+
+Di `.env`:
 
 ```bash
-GCS_URI='gs://bucket/database-backups'
-BACKUP_NAME='nama-yang-unik'
-BACKUP_DIR='/var/lib/db-backup'
+BACKUP_MONGODB=true
+BACKUP_MARIADB=true
+BACKUP_MARIADB_PHYSICAL=false
+BACKUP_POSTGRESQL=true
 ```
 
-`GCS_URI` menentukan bucket sekaligus folder dasar tujuan. Script otomatis
-menambahkan nama engine dan `BACKUP_NAME`:
-
-```text
-GCS_URI/ENGINE/BACKUP_NAME/NAMA_FILE
-
-gs://bucket/database-backups/mongodb/production-mongodb/...
-gs://bucket/database-backups/mariadb/production-mariadb/...
-gs://bucket/database-backups/postgresql/production-postgresql-app/...
-```
-
-Untuk mengganti folder GCS, cukup ubah `GCS_URI`. Contohnya
-`GCS_URI='gs://bucket-backup-prod/db-harian'`. `BACKUP_DIR` berbeda: nilai itu
-hanya folder staging sementara pada mesin lokal dan tidak menentukan tujuan GCS.
-
-MariaDB logical backup meminta daftar database aplikasi secara eksplisit. Ini
-menghindari ikut menyalin system schema dan account server:
+Lalu satu perintah menjalankan semuanya:
 
 ```bash
-MARIADB_DATABASES=('app_database' 'billing_database')
+cd /opt/auto-backup
+sudo ./backup-all.sh
 ```
 
-Account logical backup cukup diberi akses baca/metadata pada database tersebut.
-Contoh untuk setiap database yang dibackup:
-
-```sql
-CREATE USER 'backup_user'@'localhost' IDENTIFIED BY 'PASSWORD_KUAT';
-GRANT SELECT, SHOW VIEW, TRIGGER, EVENT
-  ON app_database.* TO 'backup_user'@'localhost';
-```
-
-Pada versi MariaDB yang masih menyimpan definisi routine di `mysql.proc`, opsi
-`--routines` juga memerlukan `GRANT SELECT ON mysql.proc`.
-
-PostgreSQL memakai satu database per config agar satu backup menghasilkan satu
-file. Untuk tiga database, buat tiga config dengan `PGDATABASE` dan `BACKUP_NAME`
-berbeda lalu tambahkan tiga jadwal cron.
-
-### Full physical backup MariaDB
-
-Physical backup harus dijalankan pada host MariaDB oleh OS user yang dapat membaca
-seluruh datadir dan file plugin/encryption MariaDB. Biasanya gunakan OS user
-`mysql`. Versi `mariadb-backup` harus sama dengan versi MariaDB Server.
-
-Siapkan direktori dan config terpisah:
+Atau jalankan satu engine saja:
 
 ```bash
-sudo install -d -o mysql -g mysql -m 700 \
-  /etc/mariadb-backup /var/lib/mariadb-backup /var/log/mariadb-backup
-sudo install -o mysql -g mysql -m 600 config/mariabackup.conf.example \
-  /etc/mariadb-backup/mariabackup.conf
-sudo install -o mysql -g mysql -m 600 config/mariabackup.cnf.example \
-  /etc/mariadb-backup/mariabackup.cnf
-sudo install -o mysql -g mysql -m 600 /dev/null \
-  /var/log/mariadb-backup/backup.log
+sudo ./backup-mongodb.sh
+sudo ./backup-mariadb.sh
+sudo ./backup-mariadb-physical.sh
+sudo ./backup-postgresql.sh
 ```
 
-Siapkan user database khusus. Contoh privilege MariaDB modern:
+Semua script otomatis membaca `/opt/auto-backup/.env`. Path `.env` lain juga boleh:
+
+```bash
+sudo ./backup-postgresql.sh /etc/backup-prod.env
+```
+
+## 3. GCS authentication
+
+### Opsi A — VM/service account sudah terpasang
+
+Biarkan:
+
+```bash
+GCP_SERVICE_ACCOUNT_FILE=''
+```
+
+Tes:
+
+```bash
+gcloud storage ls gs://NAMA_BUCKET
+```
+
+### Opsi B — JSON service account
+
+Taruh file JSON secara private:
+
+```bash
+sudo install -m 600 key.json /opt/auto-backup/service-account.json
+```
+
+Isi `.env`:
+
+```bash
+GCP_SERVICE_ACCOUNT_FILE="$SCRIPT_DIR/service-account.json"
+```
+
+Script akan menjalankan `gcloud auth activate-service-account` otomatis sebelum upload.
+Jangan commit `.env` atau `service-account.json`.
+
+## 4. MongoDB
+
+Contoh satu database:
+
+```bash
+MONGO_HOST='127.0.0.1'
+MONGO_PORT=27017
+MONGO_USER='backup_user'
+MONGO_PASSWORD='password'
+MONGO_AUTH_DB='admin'
+MONGO_DATABASE='equipment'
+MONGO_COLLECTION=''
+```
+
+Satu collection:
+
+```bash
+MONGO_DATABASE='equipment'
+MONGO_COLLECTION='live_locations'
+```
+
+Semua database:
+
+```bash
+MONGO_DATABASE=''
+MONGO_COLLECTION=''
+```
+
+Untuk replica set:
+
+```bash
+MONGO_REPLICA_SET='rs0'
+```
+
+Jika `MONGO_REPLICA_SET` diisi dan `MONGO_DATABASE`/`MONGO_COLLECTION` dikosongkan, script otomatis menambahkan `--oplog` sehingga full dump replica set dapat direstore dengan `--oplogReplay`. Opsi ini memang tidak boleh digabung dengan `--db` atau `--collection`.
+
+Password MongoDB tidak dikirim lewat argument process. Script membuat file YAML sementara untuk `mongodump --config`, sesuai mekanisme yang direkomendasikan MongoDB Database Tools.
+
+> Catatan konsistensi: `mongodump` dapat membackup seluruh server, database, atau collection. Backup scoped ke satu DB/collection tidak menggunakan `--oplog`. Hindari migration/DDL dan write penting selama backup bila Anda membutuhkan snapshot lintas collection yang benar-benar seragam.
+
+## 5. MariaDB logical
+
+Satu database:
+
+```bash
+MARIADB_DATABASES='app_database'
+```
+
+Beberapa database:
+
+```bash
+MARIADB_DATABASES='app_database,billing_database'
+```
+
+Untuk server lokal gunakan socket:
+
+```bash
+MARIADB_SOCKET='/run/mysqld/mysqld.sock'
+```
+
+Untuk TCP:
+
+```bash
+MARIADB_SOCKET=''
+MARIADB_HOST='10.10.10.10'
+MARIADB_PORT=3306
+```
+
+Jika memakai TLS:
+
+```bash
+MARIADB_SSL_CA='/etc/ssl/certs/mariadb-ca.pem'
+```
+
+Logical backup memakai `--single-transaction` dan menolak tabel non-InnoDB supaya tidak memberi kesan backup konsisten padahal tidak.
+
+## 6. MariaDB physical
+
+Physical backup memakai `mariadb-backup` / `mariabackup`, `xbstream`, dan `zstd`.
+Backup ini selalu mencakup seluruh instance MariaDB termasuk system tables/user/grant yang berada di datadir.
+
+Contoh:
+
+```bash
+MARIADB_PHYSICAL_USER='mariabackup'
+MARIADB_PHYSICAL_PASSWORD='password'
+MARIADB_PHYSICAL_SOCKET='/run/mysqld/mysqld.sock'
+MARIABACKUP_PARALLEL=1
+ZSTD_LEVEL=3
+ZSTD_THREADS=1
+```
+
+Contoh privilege user physical (sesuaikan dengan versi MariaDB Anda):
 
 ```sql
 CREATE USER 'mariabackup'@'localhost' IDENTIFIED BY 'PASSWORD_KUAT';
-GRANT RELOAD, PROCESS, LOCK TABLES, BINLOG MONITOR
-  ON *.* TO 'mariabackup'@'localhost';
+GRANT RELOAD, PROCESS, LOCK TABLES, BINLOG MONITOR ON *.* TO 'mariabackup'@'localhost';
 ```
 
-Gunakan privilege yang sesuai dengan versi MariaDB Anda; versi lama memakai nama
-`REPLICATION CLIENT`. Script tidak memakai `--history`, sehingga tidak menulis
-record riwayat backup ke database.
+Gunakan versi `mariadb-backup` yang kompatibel dengan server MariaDB.
 
-Pastikan autentikasi gcloud tersedia untuk OS user yang sama:
+## 7. PostgreSQL
+
+Contoh lokal via Unix socket:
 
 ```bash
-sudo -u mysql env HOME=/var/lib/mariadb-backup gcloud auth list
-sudo -u mysql env HOME=/var/lib/mariadb-backup \
-  gcloud storage ls gs://NAMA_BUCKET
+POSTGRES_HOST='/var/run/postgresql'
+POSTGRES_PORT=5432
+POSTGRES_USER='backup_user'
+POSTGRES_PASSWORD='password'
+POSTGRES_DATABASE='app_database'
 ```
 
-Jika autentikasi awal memakai JSON key, letakkan sementara di
-`/etc/mariadb-backup/gcp-service-account.json` dengan owner `mysql` dan mode `600`,
-lalu jalankan `gcloud auth activate-service-account` sebagai OS user `mysql`.
-Script physical backup tidak membaca file JSON tersebut.
-
-## Menjalankan
-
-Uji manual menggunakan user yang sama dengan cron:
+Untuk remote:
 
 ```bash
-sudo -H -u dbbackup /opt/db-backup/backup-mariadb.sh /etc/db-backup/mariadb.conf
+POSTGRES_HOST='postgres.example.com'
+POSTGRES_SSLMODE='verify-full'
+POSTGRES_SSLROOTCERT='/etc/ssl/certs/postgres-ca.pem'
 ```
 
-Ganti script/config untuk MongoDB atau PostgreSQL. Pesan `SUCCESS: gs://...`
-menunjukkan lokasi file. Contoh isi bucket:
+Satu eksekusi PostgreSQL menghasilkan satu custom-format dump. Untuk database kedua, gunakan file `.env` kedua atau jadwal kedua dengan nilai `POSTGRES_DATABASE` berbeda.
+
+## 8. Cron otomatis
+
+Contoh paling sederhana sudah ada di `cron/db-backup.crontab.example`:
+
+```cron
+0 2 * * * /opt/auto-backup/backup-all.sh >>/var/log/auto-backup.log 2>&1
+```
+
+Pasang sebagai root bila physical MariaDB juga dijalankan dan membutuhkan akses host-level:
+
+```bash
+sudo crontab /opt/auto-backup/cron/db-backup.crontab.example
+sudo crontab -l
+```
+
+Untuk logical-only, Anda boleh memakai user OS khusus dengan permission minimum.
+
+## 9. Struktur object GCS
+
+Contoh:
 
 ```text
-gs://bucket/database-backups/mariadb/production-mariadb/
-├── production-mariadb-20260911T020000Z.sql.gz
-└── production-mariadb-20260911T020000Z.sql.gz.sha256
+gs://bucket/database-backups/mongodb/mongodb-equipment/
+gs://bucket/database-backups/mariadb/mariadb-logical/
+gs://bucket/database-backups/mariadb-physical/mariadb-full/
+gs://bucket/database-backups/postgresql/postgresql-app_database/
 ```
 
-File sementara otomatis dihapus setelah upload berhasil. Bila gagal, file tetap
-berada pada direktori private yang ditulis di log agar dapat diperiksa atau upload
-ulang. Lock internal mencegah jadwal backup yang sama berjalan bersamaan.
+Setiap folder berisi file backup dan file `.sha256`.
+Retention sebaiknya diatur dengan lifecycle policy pada bucket GCS, bukan dengan `rm` di server backup.
 
-Menjalankan full physical backup MariaDB:
+## 10. Restore singkat
+
+MariaDB logical:
 
 ```bash
-sudo -u mysql env HOME=/var/lib/mariadb-backup \
-  /opt/db-backup/backup-mariadb-physical.sh \
-  /etc/mariadb-backup/mariabackup.conf
+gzip -dc mariadb-logical-*.sql.gz | mariadb --user=root -p
 ```
 
-Hasilnya satu file terkompresi beserta checksum:
-
-```text
-gs://bucket/database-backups/mariadb-physical/production-mariadb-physical/
-├── production-mariadb-physical-20260914T003000Z.xbstream.zst
-└── production-mariadb-physical-20260914T003000Z.xbstream.zst.sha256
-```
-
-Anggap backup lengkap hanya jika file `.xbstream.zst` dan `.sha256` keduanya ada.
-Jika salah satu upload/verifikasi gagal, script keluar nonzero dan mempertahankan
-salinan lokal untuk diperiksa atau diunggah ulang.
-
-## Cron
-
-Buka [contoh crontab](cron/db-backup.crontab.example), sesuaikan jadwal dan email,
-lalu pasang:
+MariaDB physical:
 
 ```bash
-sudo crontab -u dbbackup cron/db-backup.crontab.example
-sudo crontab -u dbbackup -l
-```
-
-Cron langsung memanggil tiga script logical; tidak ada wrapper atau service tambahan.
-Pasang [contoh logrotate](cron/db-backup.logrotate.example) bila log disimpan terus.
-Hubungkan exit nonzero dari cron ke email atau monitoring Anda.
-
-Physical backup memiliki [contoh crontab terpisah](cron/mariabackup.crontab.example)
-karena dijalankan oleh OS user yang dapat membaca datadir:
-
-```bash
-sudo crontab -u mysql cron/mariabackup.crontab.example
-```
-
-## Restore di mesin lain
-
-Unduh file yang dipilih beserta checksum ke direktori kosong:
-
-```bash
-umask 077
-mkdir restore-work && cd restore-work
-OBJECT='gs://bucket/database-backups/mariadb/production-mariadb/production-mariadb-20260911T020000Z.sql.gz'
-gcloud storage cp "$OBJECT" .
-gcloud storage cp "$OBJECT.sha256" .
-sha256sum --check ./*.sha256
-```
-
-MariaDB logical backup:
-
-```bash
-set -o pipefail
-gzip -dc production-mariadb-*.sql.gz | \
-  mariadb --defaults-file=/etc/db-restore/target.cnf --binary-mode
-```
-
-Dump berisi `CREATE DATABASE`, table, data, trigger, routine, event, dan view.
-User/password/grant server dibuat terpisah pada mesin tujuan.
-
-Full physical backup MariaDB harus direstore sebagai satu instance utuh. Pakai
-versi `mariadb-backup` yang sama dengan versi pembuat backup:
-
-```bash
-set -o pipefail
-ARCHIVE='production-mariadb-physical-20260914T003000Z.xbstream.zst'
-zstd --test "$ARCHIVE"
-mkdir -m 700 extracted
-(cd extracted && zstd -dc "../$ARCHIVE" | mbstream -x)
+mkdir extracted
+zstd -dc mariadb-full-*.xbstream.zst | mbstream -x -C extracted
 mariadb-backup --prepare --target-dir="$PWD/extracted"
 ```
 
-Restore ke datadir kosong. Sesuaikan `/var/lib/mysql` bila datadir Anda berbeda:
+MongoDB biasa / backup DB atau collection:
 
 ```bash
-sudo systemctl stop mariadb
-sudo mv /var/lib/mysql /var/lib/mysql.before-physical-restore
-sudo install -d -o mysql -g mysql -m 750 /var/lib/mysql
-sudo mariadb-backup --copy-back --target-dir="$PWD/extracted"
-sudo chown -R mysql:mysql /var/lib/mysql
-sudo systemctl start mariadb
+mongorestore --archive=mongodb-*.archive.gz --gzip --stopOnError
 ```
 
-Jangan menjalankan `--copy-back` ketika MariaDB aktif. Physical backup mencakup
-semua database, system tables, user, role, dan grant dalam instance. Binlog dan
-file konfigurasi/secret eksternal tidak ikut; simpan terpisah bila dibutuhkan.
-
-MongoDB replica set:
+Untuk **full dump replica set** yang otomatis memakai `--oplog`, tambahkan:
 
 ```bash
-mongorestore --config=/etc/db-restore/target-mongodb.yml \
-  --archive=production-mongodb-*.archive.gz --gzip --oplogReplay --stopOnError
+mongorestore --archive=mongodb-all-*.archive.gz --gzip --oplogReplay --stopOnError
 ```
-
-Untuk backup standalone, hilangkan `--oplogReplay`.
 
 PostgreSQL:
 
 ```bash
-createdb --host=TARGET_HOST --username=TARGET_USER target_database
-pg_restore --host=TARGET_HOST --username=TARGET_USER --dbname=target_database \
-  --no-owner --no-acl --exit-on-error production-postgresql-*.dump
+pg_restore --dbname=target_database --no-owner --no-acl --exit-on-error postgresql-*.dump
 ```
 
-Archive PostgreSQL tidak membawa role dan grant agar mudah dipindah ke server lain.
-Buat user/role tujuan secara terpisah, lalu berikan permission yang diperlukan.
+Selalu uji restore ke environment terpisah sebelum menganggap backup siap untuk disaster recovery.
 
-## Batas keamanan dan konsistensi
+## 11. Dependency
 
-- Config dan staging bersifat private (`600` dan `700`); `set -x` dinonaktifkan agar
-  credential tidak tercetak ke log.
-- Script logical hanya menjalankan tool dump; query tambahan MariaDB hanyalah `SELECT`.
-  Tidak ada perintah perubahan data/schema. Tool dapat mengambil read/metadata lock
-  sementara dan mengubah setting sesi koneksinya sendiri, tetapi tidak mengubah data.
-- Gunakan account MariaDB dengan privilege baca/metadata saja dan role
-  PostgreSQL dengan `CONNECT`, `USAGE`, serta `SELECT` yang diperlukan. Untuk
-  MongoDB gunakan role `backup` bawaan tanpa role tambahan.
-- Upload menggunakan HTTPS dari `gcloud`, checksum transfer bawaan gcloud, SHA-256
-  tambahan, dan object tidak boleh menimpa nama yang sudah ada.
-- MariaDB memakai satu `--single-transaction` untuk semua database terpilih,
-  dan menolak table non-InnoDB. Jangan jalankan migration/DDL selama dump.
-- MongoDB replica set memakai `--oplog`; pastikan oplog cukup panjang selama dump.
-  Standalone hanya aman jika seluruh write dihentikan.
-- PostgreSQL custom dump konsisten untuk satu database dan sudah terkompresi secara
-  internal, sehingga tidak perlu zip lagi.
-- Physical MariaDB menjalankan hot backup seluruh instance dan menggunakan backup
-  locks untuk konsistensi. Ia tidak mengubah data aplikasi, tetapi dapat menahan DDL
-  sebentar. Jangan memakai `--no-lock`; script ini sengaja tidak mengaktifkannya.
-- Physical backup ditulis dahulu ke local disk sebagai `xbstream`, dikompres zstd,
-  diuji dengan `zstd --test`, dan diberi SHA-256. Kedua object GCS diverifikasi
-  ukuran dan MD5-nya; file lokal baru dihapus setelah semua verifikasi berhasil.
-- Restore physical memerlukan versi MariaDB/`mariadb-backup` yang kompatibel. Untuk
-  encrypted tables, sediakan kembali key-management plugin dan encryption key.
-- Restore selalu ke database kosong dahulu. Setelah restore, periksa jumlah data,
-  index, constraint, view/routine, dan query aplikasi sebelum memindahkan traffic.
-- Backup terjadwal ini bukan pengganti binlog/WAL/PITR. Uji restore nyata secara
-  berkala pada versi database tujuan.
+Umum:
 
-Validasi syntax setelah menyalin atau mengubah file:
+```text
+bash flock timeout sha256sum openssl base64 gcloud
+```
+
+MongoDB:
+
+```text
+mongodump
+```
+
+MariaDB logical:
+
+```text
+mariadb mariadb-dump gzip
+```
+
+MariaDB physical:
+
+```text
+mariadb-backup (atau mariabackup), mbstream, zstd
+```
+
+PostgreSQL:
+
+```text
+pg_dump pg_restore
+```
+
+## 12. Validasi script
 
 ```bash
-bash -n backup-mongodb.sh backup-mariadb.sh backup-mariadb-physical.sh \
-  backup-postgresql.sh lib/common.bash
+bash -n backup-all.sh backup-mongodb.sh backup-mariadb.sh \
+  backup-mariadb-physical.sh backup-postgresql.sh lib/common.bash
 ```

@@ -1,8 +1,7 @@
-# Install untuk OS user yang dapat membaca datadir, biasanya mysql:
-# sudo crontab -u mysql cron/mariabackup.crontab.example
+# Opsional bila physical MariaDB ingin dijadwalkan terpisah.
 SHELL=/bin/bash
-HOME=/var/lib/mariadb-backup
+HOME=/root
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-MAILTO=ops@example.com
+MAILTO=""
 
-30 0 * * * /opt/db-backup/backup-mariadb-physical.sh /etc/mariadb-backup/mariabackup.conf >>/var/log/mariadb-backup/backup.log 2>&1
+30 0 * * * /opt/auto-backup/backup-mariadb-physical.sh >>/var/log/auto-backup-mariadb-physical.log 2>&1

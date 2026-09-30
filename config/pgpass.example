@@ -1,2 +1,0 @@
-# chmod 600; escape literal : and backslash in fields with a backslash.
-postgres.example.com:5432:*:backup_user:REPLACE_PASSWORD
