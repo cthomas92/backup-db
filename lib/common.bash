@@ -688,9 +688,14 @@ notify_telegram() {
 
     _curl_secret_url \
         "$url" \
+        --tls-max 1.2 \
+        --http1.1 \
         -fsS \
+        --retry 3 \
+        --retry-all-errors \
+        --retry-delay 3 \
         --connect-timeout 10 \
-        --max-time 30 \
+        --max-time 60 \
         --data-urlencode "chat_id=$TELEGRAM_CHAT_ID" \
         --data-urlencode "text=$message" \
         --data 'disable_web_page_preview=true' \
