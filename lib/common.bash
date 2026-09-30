@@ -1009,36 +1009,21 @@ format_duration() {
 human_bytes() {
     local bytes=${1:-0}
 
+    awk -v b="$bytes" 'BEGIN {
+        split("B KB MB GB TB", u, " ");
+        i=1;
 
-    awk \
-        -v b="$bytes" \
-        '
-        BEGIN {
-
-            split(
-                "B KB MB GB TB",
-                u,
-                " "
-            )
-
-            i=1
-
-            while (
-                b >= 1024 &&
-                i < 5
-            ) {
-
-                b /= 1024
-
-                i++
-            }
-
-            if (i == 1)
-                printf "%.0f %s", b, u[i]
-            else
-                printf "%.2f %s", b, u[i]
+        while (b >= 1024 && i < 5) {
+            b=b/1024;
+            i++;
         }
-        '
+
+        if (i == 1) {
+            printf "%.0f %s", b, u[i];
+        } else {
+            printf "%.2f %s", b, u[i];
+        }
+    }'
 }
 
 
