@@ -116,7 +116,7 @@ chmod 600 "$defaults_file"
 # FILES
 # ============================================================
 
-artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.xbstream.zst"
+artifact="$RUN_DIR/${BACKUP_FILE_SERVER}-${BACKUP_NAME}-${STAMP}.xbstream.zst"
 
 backup_log="$LOG_DIR/mariadb-physical-${STAMP}.log"
 

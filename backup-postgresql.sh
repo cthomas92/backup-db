@@ -74,9 +74,9 @@ for database in "${databases[@]}"; do
     export PGDATABASE=$database
 
     if (( ${#databases[@]} == 1 )); then
-        artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.dump"
+        artifact="$RUN_DIR/${BACKUP_FILE_SERVER}-${BACKUP_NAME}-${STAMP}.dump"
     else
-        artifact="$RUN_DIR/${BACKUP_NAME}-${database}-${STAMP}.dump"
+        artifact="$RUN_DIR/${BACKUP_FILE_SERVER}-${BACKUP_NAME}-${database}-${STAMP}.dump"
     fi
 
     log "Dump database: $database"

@@ -547,6 +547,22 @@ cleanup_resources() {
 }
 
 
+
+backup_file_server_name() {
+    local name=${BACKUP_HOST_NAME:-}
+
+    if [[ -z $name ]]; then
+        name=$(hostname -s 2>/dev/null || hostname)
+    fi
+
+    name=${name//[^a-zA-Z0-9_.-]/_}
+    name=${name:0:63}
+
+    [[ $name =~ ^[a-zA-Z0-9] ]] || name="server-$name"
+
+    printf '%s' "$name"
+}
+
 begin_backup() {
     required BACKUP_NAME
 
@@ -585,6 +601,9 @@ begin_backup() {
 
     flock -n 9 \
         || die "Backup yang sama masih berjalan"
+
+
+    BACKUP_FILE_SERVER=$(backup_file_server_name)
 
 
     STAMP=$(date -u +%Y%m%dT%H%M%SZ)

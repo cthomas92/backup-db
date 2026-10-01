@@ -73,7 +73,7 @@ if [[ -n $MONGO_REPLICA_SET && -z $MONGO_DATABASE && -z $MONGO_COLLECTION ]]; th
     log "Replica set full dump: aktifkan oplog untuk snapshot point-in-time"
 fi
 
-artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.archive.gz"
+artifact="$RUN_DIR/${BACKUP_FILE_SERVER}-${BACKUP_NAME}-${STAMP}.archive.gz"
 args+=(--archive="$artifact")
 if [[ -n $MONGO_COLLECTION ]]; then
     log "Dump collection: $MONGO_DATABASE.$MONGO_COLLECTION"

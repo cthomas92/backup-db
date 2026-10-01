@@ -190,7 +190,7 @@ fi
 # OUTPUT
 # ============================================================
 
-artifact="$RUN_DIR/${BACKUP_NAME}-${STAMP}.sql.gz"
+artifact="$RUN_DIR/${BACKUP_FILE_SERVER}-${BACKUP_NAME}-${STAMP}.sql.gz"
 
 dump_log="$LOG_DIR/mariadb-dump-${STAMP}.log"
 
