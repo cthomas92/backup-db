@@ -14,6 +14,8 @@ config_file=${1:-"$SCRIPT_DIR/.env"}
 
 load_config "$config_file"
 
+GCS_BACKUP_PATH="mariadb/mariadb-logical"
+
 
 for command in \
     mariadb \

@@ -792,7 +792,7 @@ upload_backup() {
     )
 
 
-    remote="${GCS_URI%/}/$ENGINE/$BACKUP_NAME"
+    remote="${GCS_URI%/}/${GCS_BACKUP_PATH:-$ENGINE/$BACKUP_NAME}"
 
 
     export CLOUDSDK_CORE_DISABLE_PROMPTS=1
