@@ -77,7 +77,7 @@ for command in mongosh grep awk sort date; do
 done
 
 if [[ $mode != check-years ]]; then
-    for command in mongodump mongorestore gzip df; do
+    for command in mongodump mongorestore gzip df wc; do
         need "$command"
     done
 fi
@@ -374,6 +374,40 @@ run_mongosh_script() {
     )
 }
 
+# Jalankan query mongosh sambil memberi heartbeat setiap 30 detik.
+# Output stdout tetap dipisahkan dari log supaya parsing BOUNDARY/COUNT aman.
+run_mongosh_with_progress() {
+    local step_label=$1
+    shift
+    local output_file watcher_pid rc
+    local started=$SECONDS
+
+    output_file=$(mktemp "$RUN_DIR/.mongosh-result.XXXXXXXX") || return 1
+    chmod 600 "$output_file"
+
+    (
+        while sleep 30; do
+            log "WAIT: $step_label masih berjalan ($((SECONDS - started)) detik); menunggu respons MongoDB..." >&2
+        done
+    ) >/dev/null &
+    watcher_pid=$!
+
+    # Query MongoDB tetap berjalan sinkron; yang background hanya timer log.
+    if run_mongosh_script "$@" >"$output_file"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    kill "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    if (( rc == 0 )); then
+        cat "$output_file"
+    fi
+    rm -f -- "$output_file"
+    return "$rc"
+}
+
 report_available_years() {
     local index
     local collection
@@ -399,7 +433,9 @@ report_available_years() {
         export ARCHIVE_COLLECTION=$collection
         export ARCHIVE_DATE_FIELD=$date_field
 
-        output=$(run_mongosh_script "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
+        log "CHECK: mencari tahun untuk $collection (field: $date_field)"
+        output=$(run_mongosh_with_progress "daftar tahun $collection" \
+            "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
             || die "Gagal memeriksa tahun pada $collection"
 
         mapfile -t found_years < <(
@@ -469,6 +505,14 @@ check_free_space() {
         || die "Free space kurang dari ${MONGO_ARCHIVE_MIN_FREE_GB} GB; kecilkan MONGO_ARCHIVE_CHUNK"
 }
 
+# Statistik sesi, dihitung hanya untuk rentang yang benar-benar diproses.
+archive_run_started=$SECONDS
+archive_ranges_checked=0
+archive_ranges_empty=0
+archive_ranges_backed_up=0
+archive_documents_backed_up=0
+archive_documents_deleted=0
+
 process_range() {
     local collection=$1
     local date_field=$2
@@ -488,7 +532,14 @@ process_range() {
     local deleted_count
     local remaining_count
     local query_file
+    local artifact_name
     local artifact
+    local range_started=$SECONDS
+    local step_started
+    local artifact_bytes
+
+    archive_ranges_checked=$((archive_ranges_checked + 1))
+    log "CHECK: $collection periode $range_label | field=$date_field | rentang=$range_start_local s.d. $range_end_local (akhir eksklusif) | zona=$MONGO_ARCHIVE_TIMEZONE"
 
     start_iso=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date --iso-8601=seconds -d "$range_start_local 00:00:00")
     end_iso=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date --iso-8601=seconds -d "$range_end_local 00:00:00")
@@ -498,10 +549,14 @@ process_range() {
     export ARCHIVE_START=$start_iso
     export ARCHIVE_END=$end_iso
 
-    boundary_output=$(run_mongosh_script "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$boundary_js") \
+    step_started=$SECONDS
+    boundary_output=$(run_mongosh_with_progress "boundary $collection $range_label" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$boundary_js") \
         || die "Gagal menentukan boundary $collection $range_label"
 
     if grep -qx 'EMPTY' <<<"$boundary_output"; then
+        archive_ranges_empty=$((archive_ranges_empty + 1))
+        log "SKIP: $collection periode $range_label kosong (cek $((SECONDS - step_started)) detik; total $((SECONDS - range_started)) detik)"
         return 0
     fi
 
@@ -510,6 +565,7 @@ process_range() {
     IFS=$'\t' read -r _ max_id expected_count <<<"$boundary_line"
     [[ $max_id =~ ^[0-9a-fA-F]{24}$ ]] || die "ObjectId boundary tidak valid"
     [[ $expected_count =~ ^[1-9][0-9]*$ ]] || die "Jumlah dokumen boundary tidak valid"
+    log "FOUND: $collection periode $range_label | $expected_count dokumen (cek $((SECONDS - step_started)) detik)"
 
     check_free_space
 
@@ -518,9 +574,13 @@ process_range() {
         "$date_field" "$start_iso" "$end_iso" "$max_id" >"$query_file"
     chmod 600 "$query_file"
 
-    artifact="$RUN_DIR/${BACKUP_FILE_SERVER}-${safe_db}-${collection}-${range_label}-${STAMP}.archive.gz"
+    artifact_name="${BACKUP_FILE_SERVER}-${safe_db}-${collection}-period-${range_label}-backup-${STAMP}.archive.gz"
+    (( ${#artifact_name} <= 240 )) \
+        || die "Nama file backup terlalu panjang: $artifact_name"
+    artifact="$RUN_DIR/$artifact_name"
 
-    log "Archive $collection $range_label ($expected_count dokumen)"
+    log "DUMP: mulai $collection periode $range_label ($expected_count dokumen) -> $artifact_name"
+    step_started=$SECONDS
     run_backup mongodump \
         "${dump_connection[@]}" \
         --db="$MONGO_ARCHIVE_DATABASE" \
@@ -528,7 +588,11 @@ process_range() {
         --queryFile="$query_file" \
         --gzip \
         --archive="$artifact"
+    artifact_bytes=$(wc -c < "$artifact")
+    log "DUMP: selesai $collection periode $range_label | ukuran=${artifact_bytes} byte | durasi=$((SECONDS - step_started)) detik"
 
+    log "VERIFY: mulai gzip test + mongorestore dry-run untuk $artifact_name"
+    step_started=$SECONDS
     gzip -t "$artifact"
     run_backup mongorestore \
         "${restore_connection[@]}" \
@@ -538,20 +602,30 @@ process_range() {
         --verbose \
         --nsInclude="${MONGO_ARCHIVE_DATABASE}.${collection}" \
         >/dev/null
+    log "VERIFY: selesai $collection periode $range_label ($((SECONDS - step_started)) detik)"
 
     GCS_BACKUP_PATH="mongodb/archive/${safe_db}/${collection}/${year}"
+    log "UPLOAD: mulai $artifact_name ke $GCS_URI$GCS_BACKUP_PATH/"
+    step_started=$SECONDS
     upload_backup "$artifact"
+    log "UPLOAD: selesai $collection periode $range_label ($((SECONDS - step_started)) detik)"
 
     if bool_value "$MONGO_ARCHIVE_DELETE_AFTER_UPLOAD"; then
         export ARCHIVE_MAX_ID=$max_id
-        count_output=$(run_mongosh_script "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$count_js") \
+        log "RECOUNT: cek ulang jumlah dokumen sebelum delete $collection periode $range_label"
+        step_started=$SECONDS
+        count_output=$(run_mongosh_with_progress "recount $collection $range_label" \
+            "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$count_js") \
             || die "Gagal memeriksa ulang jumlah dokumen $collection $range_label"
         current_count=$(awk -F '\t' '$1 == "ARCHIVE_COUNT" {print $2; exit}' <<<"$count_output")
         [[ $current_count =~ ^[0-9]+$ ]] || die "Hasil recount tidak valid"
         [[ $current_count == "$expected_count" ]] \
             || die "Jumlah dokumen berubah setelah backup ($expected_count menjadi $current_count); data tidak dihapus"
+        log "RECOUNT: sesuai ($current_count dokumen; $((SECONDS - step_started)) detik)"
 
-        delete_output=$(run_mongosh_script \
+        log "DELETE: mulai $collection periode $range_label (batch $MONGO_ARCHIVE_DELETE_BATCH_SIZE)"
+        step_started=$SECONDS
+        delete_output=$(run_mongosh_with_progress "delete $collection $range_label" \
             "$MONGO_ARCHIVE_DELETE_USER" \
             "$MONGO_ARCHIVE_DELETE_PASSWORD" \
             "${MONGO_ARCHIVE_DELETE_AUTH_DB:-$MONGO_AUTH_DB}" \
@@ -562,12 +636,16 @@ process_range() {
         [[ $deleted_count == "$expected_count" && $remaining_count == 0 ]] \
             || die "Verifikasi penghapusan gagal untuk $collection $range_label"
 
-        log "Terhapus aman: $collection $range_label ($deleted_count dokumen)"
+        archive_documents_deleted=$((archive_documents_deleted + deleted_count))
+        log "DELETE: sukses $collection periode $range_label | $deleted_count dokumen dihapus | sisa=$remaining_count | durasi=$((SECONDS - step_started)) detik"
     else
-        log "Archive terverifikasi; delete nonaktif untuk $collection $range_label"
+        log "DELETE: nonaktif (--backup); data MongoDB tidak dihapus untuk $collection periode $range_label"
     fi
 
+    archive_ranges_backed_up=$((archive_ranges_backed_up + 1))
+    archive_documents_backed_up=$((archive_documents_backed_up + expected_count))
     rm -f -- "$artifact" "$artifact.sha256" "$query_file"
+    log "DONE: $collection periode $range_label | $expected_count dokumen | $((SECONDS - range_started)) detik total"
 }
 
 process_year() {
@@ -633,7 +711,9 @@ for index in "${!collections[@]}"; do
     if [[ $MONGO_ARCHIVE_YEARS == auto ]]; then
         export ARCHIVE_COLLECTION=$collection
         export ARCHIVE_DATE_FIELD=$date_field
-        years_output=$(run_mongosh_script "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
+        log "CHECK: mencari tahun tersedia untuk $collection (mode auto)"
+        years_output=$(run_mongosh_with_progress "daftar tahun $collection" \
+            "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
             || die "Gagal mencari tahun pada $collection"
         mapfile -t available_years < <(
             awk -F '\t' '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ {print $2}' \
@@ -656,11 +736,14 @@ for index in "${!collections[@]}"; do
     fi
 
     for year in "${years[@]}"; do
-        log "Proses $collection tahun $year"
+        log "YEAR: mulai $collection tahun $year | chunk=$MONGO_ARCHIVE_CHUNK"
+        year_started=$SECONDS
         process_year "$collection" "$date_field" "$year"
+        log "YEAR: selesai $collection tahun $year | durasi=$((SECONDS - year_started)) detik"
     done
 done
 
+log "SUMMARY: mode=--$mode | periode dicek=$archive_ranges_checked | kosong=$archive_ranges_empty | di-backup=$archive_ranges_backed_up | dokumen di-backup=$archive_documents_backed_up | dokumen dihapus=$archive_documents_deleted | durasi=$((SECONDS - archive_run_started)) detik"
 if [[ $mode == delete ]]; then
     log "Archive dan delete selesai; tahun $current_year tetap dilindungi"
 else
