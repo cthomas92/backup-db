@@ -85,10 +85,6 @@ fi
 required MONGO_USER
 required MONGO_PASSWORD
 required MONGO_ARCHIVE_DATABASE
-required MONGO_ARCHIVE_COLLECTION_1
-required MONGO_ARCHIVE_DATE_FIELD_1
-required MONGO_ARCHIVE_COLLECTION_2
-required MONGO_ARCHIVE_DATE_FIELD_2
 if [[ $mode != check-years ]]; then
     required MONGO_ARCHIVE_YEARS
 fi
@@ -131,16 +127,6 @@ done
     || die "MONGO_PORT tidak valid"
 [[ $MONGO_ARCHIVE_DATABASE =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] \
     || die "MONGO_ARCHIVE_DATABASE tidak valid"
-[[ $MONGO_ARCHIVE_COLLECTION_1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] \
-    || die "MONGO_ARCHIVE_COLLECTION_1 tidak valid"
-[[ $MONGO_ARCHIVE_COLLECTION_2 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] \
-    || die "MONGO_ARCHIVE_COLLECTION_2 tidak valid"
-[[ $MONGO_ARCHIVE_COLLECTION_1 != "$MONGO_ARCHIVE_COLLECTION_2" ]] \
-    || die "Dua collection archive harus berbeda"
-[[ $MONGO_ARCHIVE_DATE_FIELD_1 =~ ^[a-zA-Z_][a-zA-Z0-9_.]*$ ]] \
-    || die "MONGO_ARCHIVE_DATE_FIELD_1 tidak valid"
-[[ $MONGO_ARCHIVE_DATE_FIELD_2 =~ ^[a-zA-Z_][a-zA-Z0-9_.]*$ ]] \
-    || die "MONGO_ARCHIVE_DATE_FIELD_2 tidak valid"
 [[ $MONGO_ARCHIVE_TIMEZONE =~ ^[a-zA-Z0-9_+.-]+(/[a-zA-Z0-9_+.-]+)*$ \
    && $MONGO_ARCHIVE_TIMEZONE != *..* \
    && -e /usr/share/zoneinfo/$MONGO_ARCHIVE_TIMEZONE ]] \
@@ -160,8 +146,52 @@ if [[ $mode != check-years ]] \
     die "mongorestore harus mendukung --dryRun untuk validasi archive"
 fi
 
-collections=("$MONGO_ARCHIVE_COLLECTION_1" "$MONGO_ARCHIVE_COLLECTION_2")
-date_fields=("$MONGO_ARCHIVE_DATE_FIELD_1" "$MONGO_ARCHIVE_DATE_FIELD_2")
+collections=()
+date_fields=()
+collection_specs=()
+
+if declare -p MONGO_ARCHIVE_COLLECTIONS >/dev/null 2>&1; then
+    collection_declaration=$(declare -p MONGO_ARCHIVE_COLLECTIONS)
+    [[ $collection_declaration == 'declare -a '* ]] \
+        || die "MONGO_ARCHIVE_COLLECTIONS harus Bash indexed array"
+    (( ${#MONGO_ARCHIVE_COLLECTIONS[@]} > 0 )) \
+        || die "MONGO_ARCHIVE_COLLECTIONS tidak boleh kosong"
+    collection_specs=("${MONGO_ARCHIVE_COLLECTIONS[@]}")
+else
+    # Kompatibilitas sementara dengan format lama.
+    required MONGO_ARCHIVE_COLLECTION_1
+    required MONGO_ARCHIVE_DATE_FIELD_1
+    collection_specs+=("${MONGO_ARCHIVE_COLLECTION_1}:${MONGO_ARCHIVE_DATE_FIELD_1}")
+
+    if [[ -n ${MONGO_ARCHIVE_COLLECTION_2:-} \
+       || -n ${MONGO_ARCHIVE_DATE_FIELD_2:-} ]]; then
+        required MONGO_ARCHIVE_COLLECTION_2
+        required MONGO_ARCHIVE_DATE_FIELD_2
+        collection_specs+=("${MONGO_ARCHIVE_COLLECTION_2}:${MONGO_ARCHIVE_DATE_FIELD_2}")
+    fi
+fi
+
+for collection_spec in "${collection_specs[@]}"; do
+    [[ $collection_spec == *:* ]] \
+        || die "Format collection harus NAMA_COLLECTION:FIELD_TANGGAL"
+
+    collection_name=${collection_spec%%:*}
+    date_field_name=${collection_spec#*:}
+
+    [[ $collection_name =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$ ]] \
+        || die "Nama collection tidak valid: $collection_name"
+    [[ $date_field_name =~ ^[a-zA-Z_][a-zA-Z0-9_.]*$ ]] \
+        || die "Field tanggal tidak valid untuk $collection_name: $date_field_name"
+
+    for existing_collection in "${collections[@]}"; do
+        [[ $existing_collection != "$collection_name" ]] \
+            || die "Collection tercantum lebih dari sekali: $collection_name"
+    done
+
+    collections+=("$collection_name")
+    date_fields+=("$date_field_name")
+done
+
 current_year=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date +%Y)
 
 if [[ $mode == delete ]]; then
@@ -169,7 +199,11 @@ if [[ $mode == delete ]]; then
     required MONGO_ARCHIVE_DELETE_PASSWORD
     required MONGO_ARCHIVE_DELETE_CONFIRM
 
-    expected_confirmation="DELETE ${MONGO_ARCHIVE_DATABASE}.${MONGO_ARCHIVE_COLLECTION_1},${MONGO_ARCHIVE_DATABASE}.${MONGO_ARCHIVE_COLLECTION_2}"
+    confirmation_targets=()
+    for collection_name in "${collections[@]}"; do
+        confirmation_targets+=("${MONGO_ARCHIVE_DATABASE}.${collection_name}")
+    done
+    expected_confirmation="DELETE $(IFS=,; printf '%s' "${confirmation_targets[*]}")"
     [[ $MONGO_ARCHIVE_DELETE_CONFIRM == "$expected_confirmation" ]] \
         || die "MONGO_ARCHIVE_DELETE_CONFIRM harus persis: $expected_confirmation"
 
@@ -402,9 +436,9 @@ report_available_years() {
     done
 
     if [[ -n $overall_oldest ]]; then
-        printf 'Tahun paling tua dari kedua collection: %s\n' "$overall_oldest"
+        printf 'Tahun paling tua dari semua collection: %s\n' "$overall_oldest"
     else
-        printf 'Tidak ditemukan data BSON Date pada kedua collection.\n'
+        printf 'Tidak ditemukan data BSON Date pada collection yang dikonfigurasi.\n'
     fi
 }
 
