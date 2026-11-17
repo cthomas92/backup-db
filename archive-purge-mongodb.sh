@@ -8,30 +8,46 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/common.bash
 source "$SCRIPT_DIR/lib/common.bash"
 
-mode=archive
+mode=''
 config_file="$SCRIPT_DIR/.env"
 
+usage() {
+    printf 'Cara pakai:\n'
+    printf '  %s --check-years [/.env]\n' "$0"
+    printf '  %s --backup [/.env]\n' "$0"
+    printf '  %s --delete [/.env]\n' "$0"
+    printf '\nTahun selalu dibaca dari MONGO_ARCHIVE_YEARS di .env.\n'
+}
+
 case $# in
-    0)
-        ;;
-    1)
-        if [[ $1 == --check-years ]]; then
-            mode=check-years
-        elif [[ $1 == --help || $1 == -h ]]; then
-            printf 'Cara pakai:\n  %s [/.env]\n  %s --check-years [/.env]\n' "$0" "$0"
-            exit 0
-        else
-            config_file=$1
+    1|2)
+        case $1 in
+            --check-years)
+                mode=check-years
+                ;;
+            --backup)
+                mode=backup
+                ;;
+            --delete)
+                mode=delete
+                ;;
+            --help|-h)
+                (( $# == 1 )) || { usage >&2; exit 2; }
+                usage
+                exit 0
+                ;;
+            *)
+                usage >&2
+                exit 2
+                ;;
+        esac
+        if (( $# == 2 )); then
+            config_file=$2
         fi
         ;;
-    2)
-        [[ $1 == --check-years ]] \
-            || die "Cara pakai: $0 [/.env] atau $0 --check-years [/.env]"
-        mode=check-years
-        config_file=$2
-        ;;
     *)
-        die "Cara pakai: $0 [/.env] atau $0 --check-years [/.env]"
+        usage >&2
+        exit 2
         ;;
 esac
 
@@ -40,6 +56,16 @@ if [[ $mode == check-years ]]; then
 fi
 
 load_config "$config_file"
+
+# Action ditentukan command; tahun tetap dibaca dari MONGO_ARCHIVE_YEARS di .env.
+case $mode in
+    check-years|backup)
+        MONGO_ARCHIVE_DELETE_AFTER_UPLOAD=false
+        ;;
+    delete)
+        MONGO_ARCHIVE_DELETE_AFTER_UPLOAD=true
+        ;;
+esac
 
 if [[ $mode == check-years ]]; then
     # Pemeriksaan tahun tidak memerlukan aktivasi service account GCS.
@@ -50,7 +76,7 @@ for command in mongosh grep awk sort date; do
     need "$command"
 done
 
-if [[ $mode == archive ]]; then
+if [[ $mode != check-years ]]; then
     for command in mongodump mongorestore gzip df; do
         need "$command"
     done
@@ -63,7 +89,7 @@ required MONGO_ARCHIVE_COLLECTION_1
 required MONGO_ARCHIVE_DATE_FIELD_1
 required MONGO_ARCHIVE_COLLECTION_2
 required MONGO_ARCHIVE_DATE_FIELD_2
-if [[ $mode == archive ]]; then
+if [[ $mode != check-years ]]; then
     required MONGO_ARCHIVE_YEARS
 fi
 
@@ -76,7 +102,6 @@ fi
 : "${MONGO_ARCHIVE_CHUNK:=month}"
 : "${MONGO_ARCHIVE_MIN_FREE_GB:=5}"
 : "${MONGO_ARCHIVE_DELETE_BATCH_SIZE:=10000}"
-: "${MONGO_ARCHIVE_DELETE_AFTER_UPLOAD:=false}"
 : "${MONGO_ARCHIVE_OLD_DATA_IMMUTABLE:=false}"
 : "${MONGO_ARCHIVE_WRITES_PAUSED:=false}"
 
@@ -96,7 +121,6 @@ validate_bool_setting() {
 
 for name in \
     MONGO_TLS \
-    MONGO_ARCHIVE_DELETE_AFTER_UPLOAD \
     MONGO_ARCHIVE_OLD_DATA_IMMUTABLE \
     MONGO_ARCHIVE_WRITES_PAUSED
 do
@@ -131,7 +155,7 @@ done
    && $MONGO_ARCHIVE_DELETE_BATCH_SIZE -le 100000 ]] \
     || die "MONGO_ARCHIVE_DELETE_BATCH_SIZE harus 1-100000"
 
-if [[ $mode == archive ]] \
+if [[ $mode != check-years ]] \
    && ! mongorestore --help 2>&1 | grep -q -- '--dryRun'; then
     die "mongorestore harus mendukung --dryRun untuk validasi archive"
 fi
@@ -140,8 +164,7 @@ collections=("$MONGO_ARCHIVE_COLLECTION_1" "$MONGO_ARCHIVE_COLLECTION_2")
 date_fields=("$MONGO_ARCHIVE_DATE_FIELD_1" "$MONGO_ARCHIVE_DATE_FIELD_2")
 current_year=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date +%Y)
 
-if [[ $mode == archive ]] \
-   && bool_value "$MONGO_ARCHIVE_DELETE_AFTER_UPLOAD"; then
+if [[ $mode == delete ]]; then
     required MONGO_ARCHIVE_DELETE_USER
     required MONGO_ARCHIVE_DELETE_PASSWORD
     required MONGO_ARCHIVE_DELETE_CONFIRM
@@ -154,8 +177,8 @@ if [[ $mode == archive ]] \
        && ! bool_value "$MONGO_ARCHIVE_WRITES_PAUSED"; then
         die "Untuk menghapus, set MONGO_ARCHIVE_OLD_DATA_IMMUTABLE=true atau hentikan write lalu set MONGO_ARCHIVE_WRITES_PAUSED=true"
     fi
-elif [[ $mode == archive ]]; then
-    log "Mode archive-only: data MongoDB tidak akan dihapus"
+elif [[ $mode == backup ]]; then
+    log "Mode --backup: data MongoDB tidak akan dihapus"
 fi
 
 safe_db=${MONGO_ARCHIVE_DATABASE//[^a-zA-Z0-9_.-]/_}
@@ -183,7 +206,7 @@ shell_connection=(--quiet --norc --host "$host_arg")
 dump_connection=()
 restore_connection=()
 
-if [[ $mode == archive ]]; then
+if [[ $mode != check-years ]]; then
     mongo_config="$RUN_DIR/mongodb.yml"
     TEMP_CREDENTIAL_FILE=$mongo_config
     printf 'password: "%s"\n' "$(escape_quoted_value "$MONGO_PASSWORD")" >"$mongo_config"
