@@ -383,13 +383,15 @@ report_available_years() {
     local oldest
     local overall_oldest=''
     local all_list
-    local eligible_list
+    local backup_list
+    local delete_list
     local -a found_years=()
-    local -a eligible_years=()
+    local -a backup_years=()
+    local -a delete_years=()
 
     printf 'Database: %s\n' "$MONGO_ARCHIVE_DATABASE"
     printf 'Timezone: %s\n' "$MONGO_ARCHIVE_TIMEZONE"
-    printf 'Tahun berjalan yang dilindungi: %s\n\n' "$current_year"
+    printf 'Tahun berjalan: %s (boleh backup, tidak boleh delete)\n\n' "$current_year"
 
     for index in "${!collections[@]}"; do
         collection=${collections[$index]}
@@ -415,24 +417,34 @@ report_available_years() {
             overall_oldest=$oldest
         fi
 
-        eligible_years=()
+        backup_years=()
+        delete_years=()
         for year in "${found_years[@]}"; do
+            if (( 10#$year <= 10#$current_year )); then
+                backup_years+=("$year")
+            fi
             if (( 10#$year < 10#$current_year )); then
-                eligible_years+=("$year")
+                delete_years+=("$year")
             fi
         done
 
         all_list=$(IFS=,; printf '%s' "${found_years[*]}")
-        if (( ${#eligible_years[@]} > 0 )); then
-            eligible_list=$(IFS=,; printf '%s' "${eligible_years[*]}")
+        if (( ${#backup_years[@]} > 0 )); then
+            backup_list=$(IFS=,; printf '%s' "${backup_years[*]}")
         else
-            eligible_list='tidak ada'
+            backup_list='tidak ada'
+        fi
+        if (( ${#delete_years[@]} > 0 )); then
+            delete_list=$(IFS=,; printf '%s' "${delete_years[*]}")
+        else
+            delete_list='tidak ada'
         fi
 
         printf '%s (%s):\n' "$collection" "$date_field"
         printf '  Tahun paling tua : %s\n' "$oldest"
         printf '  Tahun tersedia   : %s\n' "$all_list"
-        printf '  Boleh di-archive : %s\n\n' "$eligible_list"
+        printf '  Boleh di-backup  : %s\n' "$backup_list"
+        printf '  Boleh di-delete  : %s\n\n' "$delete_list"
     done
 
     if [[ -n $overall_oldest ]]; then
@@ -603,8 +615,11 @@ if [[ $MONGO_ARCHIVE_YEARS != auto ]]; then
         year="${year#"${year%%[![:space:]]*}"}"
         year="${year%"${year##*[![:space:]]}"}"
         [[ $year =~ ^[0-9]{4}$ ]] || die "Tahun archive tidak valid: $year"
-        (( 10#$year < 10#$current_year )) \
-            || die "Tahun $year dilindungi; hanya tahun sebelum $current_year yang boleh diproses"
+        (( 10#$year <= 10#$current_year )) \
+            || die "Tahun mendatang $year tidak boleh diproses"
+        if [[ $mode == delete ]] && (( 10#$year == 10#$current_year )); then
+            die "Tahun berjalan $year boleh di-backup tetapi tidak boleh di-delete"
+        fi
         explicit_years+=("$year")
     done
     mapfile -t explicit_years < <(printf '%s\n' "${explicit_years[@]}" | sort -nu)
@@ -620,17 +635,23 @@ for index in "${!collections[@]}"; do
         export ARCHIVE_DATE_FIELD=$date_field
         years_output=$(run_mongosh_script "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
             || die "Gagal mencari tahun pada $collection"
-        mapfile -t years < <(
-            awk -F '\t' -v current="$current_year" \
-                '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ && $2 < current {print $2}' \
+        mapfile -t available_years < <(
+            awk -F '\t' '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ {print $2}' \
                 <<<"$years_output" | sort -nu
         )
+        years=()
+        for year in "${available_years[@]}"; do
+            if (( 10#$year < 10#$current_year )) \
+               || [[ $mode == backup && $year == "$current_year" ]]; then
+                years+=("$year")
+            fi
+        done
     else
         years=("${explicit_years[@]}")
     fi
 
     if (( ${#years[@]} == 0 )); then
-        log "Tidak ada tahun lama untuk collection $collection"
+        log "Tidak ada tahun yang boleh diproses untuk collection $collection"
         continue
     fi
 
@@ -640,4 +661,8 @@ for index in "${!collections[@]}"; do
     done
 done
 
-log "Archive MongoDB selesai; tahun $current_year tetap dipertahankan"
+if [[ $mode == delete ]]; then
+    log "Archive dan delete selesai; tahun $current_year tetap dilindungi"
+else
+    log "Backup archive selesai; tidak ada data MongoDB yang dihapus"
+fi
