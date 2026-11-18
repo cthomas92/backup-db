@@ -2,6 +2,9 @@
 
 # Archive data MongoDB lama ke GCS per rentang waktu, lalu hapus hanya setelah
 # backup, checksum, upload, dan verifikasi berhasil.
+# Optimized v2: aggregation boundary; index-aware batched purge; guarded delete.
+# Fail-closed if dump, verification, or GCS upload fails.
+# Tidak menyentuh lib/common.bash dan format archive/GCS existing.
 
 ENGINE=mongodb-archive
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -141,6 +144,13 @@ done
    && $MONGO_ARCHIVE_DELETE_BATCH_SIZE -le 100000 ]] \
     || die "MONGO_ARCHIVE_DELETE_BATCH_SIZE harus 1-100000"
 
+# Validasi target GCS sebelum membuat atau menghapus backup apa pun.
+if [[ $mode != check-years ]]; then
+    required GCS_URI
+    [[ $GCS_URI == gs://*/*/ && $GCS_URI != *' '* ]] \
+        || die "GCS_URI harus berbentuk gs://nama-bucket/path/ dan diakhiri /"
+fi
+
 if [[ $mode != check-years ]] \
    && ! mongorestore --help 2>&1 | grep -q -- '--dryRun'; then
     die "mongorestore harus mendukung --dryRun untuk validasi archive"
@@ -231,6 +241,16 @@ else
     begin_backup
 fi
 
+# Tampilkan sasaran yang benar-benar dibaca dari .env (tanpa kredensial).
+collection_summary=$(IFS=,; printf '%s' "${collection_specs[*]}")
+log "CONFIG: mode=--$mode | db=$MONGO_ARCHIVE_DATABASE | collections=$collection_summary | years=${MONGO_ARCHIVE_YEARS:-auto} | chunk=$MONGO_ARCHIVE_CHUNK | timezone=$MONGO_ARCHIVE_TIMEZONE"
+if [[ $mode != check-years ]]; then
+    log "CONFIG: GCS=${GCS_URI}mongodb/archive/${MONGO_ARCHIVE_DATABASE}/... | batch=$MONGO_ARCHIVE_DELETE_BATCH_SIZE"
+fi
+if [[ $mode == delete ]]; then
+    log "DELETE_GUARD: immutable=$MONGO_ARCHIVE_OLD_DATA_IMMUTABLE | writes_paused=$MONGO_ARCHIVE_WRITES_PAUSED | target=$MONGO_ARCHIVE_DELETE_CONFIRM"
+fi
+
 host_arg="$MONGO_HOST:$MONGO_PORT"
 if [[ -n $MONGO_REPLICA_SET ]]; then
     host_arg="$MONGO_REPLICA_SET/$host_arg"
@@ -289,6 +309,8 @@ target.getCollection(e.ARCHIVE_COLLECTION).aggregate([
 JS
 
 cat >"$boundary_js" <<'JS'
+// Satu traversal untuk menghitung dokumen, memeriksa tipe _id dan max ObjectId.
+// Tidak melakukan sort({_id:-1}) yang dapat memaksa scan besar.
 const e = process.env;
 const auth = db.getSiblingDB(e.ARCHIVE_AUTH_DB);
 try { auth.auth({user: e.ARCHIVE_USER, pwd: e.ARCHIVE_PASSWORD}); }
@@ -296,20 +318,65 @@ catch (error) { console.error(error.message); quit(18); }
 const coll = db.getSiblingDB(e.ARCHIVE_DATABASE).getCollection(e.ARCHIVE_COLLECTION);
 const field = e.ARCHIVE_DATE_FIELD;
 const dateFilter = {[field]: {$gte: new Date(e.ARCHIVE_START), $lt: new Date(e.ARCHIVE_END)}};
-const nonObjectIds = coll.countDocuments({$and: [dateFilter, {$expr: {$ne: [{$type: "$_id"}, "objectId"]}}]});
-if (nonObjectIds !== 0) {
-  console.error("NON_OBJECT_ID\t" + nonObjectIds);
-  quit(42);
+
+// Pilih hanya index satu-field yang persis sesuai filter; hindari hint palsu.
+// Jika tidak ada atau metadata index tak dapat dibaca, biarkan query planner memilih.
+function dateIndexHint() {
+  try {
+    const index = coll.getIndexes().find(item => {
+      const fields = Object.keys(item.key || {});
+      return fields.length === 1 && fields[0] === field &&
+             (item.key[field] === 1 || item.key[field] === -1) &&
+             item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
+    });
+    return index ? {hint: index.name} : {};
+  } catch (error) {
+    console.error("WARN_INDEX_HINT\t" + error.message);
+    return {};
+  }
 }
-const docs = coll.find(dateFilter, {_id: 1}).sort({_id: -1}).limit(1).toArray();
-if (docs.length === 0) {
+const started = Date.now();
+const pipeline = [
+  {$match: dateFilter},
+  {$group: {
+    _id: null,
+    total: {$sum: 1},
+    maxId: {$max: "$_id"},
+    invalidIds: {$sum: {$cond: [{$eq: [{$type: "$_id"}, "objectId"]}, 0, 1]}}
+  }}
+];
+const rows = coll.aggregate(pipeline, Object.assign({allowDiskUse: true}, dateIndexHint())).toArray();
+if (rows.length === 0) {
   print("EMPTY");
   quit(0);
 }
-const maxId = docs[0]._id;
-const exactFilter = {$and: [dateFilter, {_id: {$lte: maxId}}]};
-const count = coll.countDocuments(exactFilter);
-print("BOUNDARY\t" + maxId.toHexString() + "\t" + count);
+if (rows.length !== 1) {
+  console.error("BOUNDARY_UNEXPECTED_GROUPS\t" + rows.length);
+  quit(45);
+}
+const row = rows[0];
+const total = Number(row.total);
+const invalid = Number(row.invalidIds);
+if (!Number.isSafeInteger(total) || total < 1 || !Number.isSafeInteger(invalid) || invalid < 0) {
+  console.error("BOUNDARY_INVALID_COUNT");
+  quit(46);
+}
+if (invalid !== 0) {
+  console.error("NON_OBJECT_ID\t" + invalid);
+  quit(42);
+}
+if (!row.maxId || typeof row.maxId.toHexString !== "function") {
+  console.error("BOUNDARY_INVALID_MAX_ID");
+  quit(47);
+}
+const maxId = row.maxId.toHexString();
+if (!/^[0-9a-fA-F]{24}$/.test(maxId)) {
+  console.error("BOUNDARY_INVALID_MAX_ID");
+  quit(47);
+}
+console.error("BOUNDARY_PROFILE\tdocuments=" + total +
+              "\tduration_ms=" + (Date.now() - started));
+print("BOUNDARY\t" + maxId + "\t" + total);
 JS
 
 cat >"$count_js" <<'JS'
@@ -335,22 +402,57 @@ const coll = db.getSiblingDB(e.ARCHIVE_DATABASE).getCollection(e.ARCHIVE_COLLECT
 const field = e.ARCHIVE_DATE_FIELD;
 const maxId = ObjectId.createFromHexString(e.ARCHIVE_MAX_ID);
 const batchSize = Number(e.ARCHIVE_DELETE_BATCH_SIZE);
-const filter = {$and: [
-  {[field]: {$gte: new Date(e.ARCHIVE_START), $lt: new Date(e.ARCHIVE_END)}},
-  {_id: {$lte: maxId}}
-]};
+if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100000) {
+  console.error("INVALID_DELETE_BATCH_SIZE");
+  quit(49);
+}
+const dateFilter = {[field]: {$gte: new Date(e.ARCHIVE_START), $lt: new Date(e.ARCHIVE_END)}};
+const filter = {$and: [dateFilter, {_id: {$lte: maxId}}]};
+function dateIndexHint() {
+  try {
+    const index = coll.getIndexes().find(item => {
+      const fields = Object.keys(item.key || {});
+      return fields.length === 1 && fields[0] === field &&
+             (item.key[field] === 1 || item.key[field] === -1) &&
+             item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
+    });
+    return index ? index.name : null;
+  } catch (error) {
+    console.error("WARN_INDEX_HINT\t" + error.message);
+    return null;
+  }
+}
+const hint = dateIndexHint();
 let total = 0;
+let batches = 0;
+const started = Date.now();
 while (true) {
-  const ids = coll.find(filter, {_id: 1}).sort({_id: 1}).limit(batchSize).toArray().map(row => row._id);
+  // Tidak butuh urutan _id. Gunakan index tanggal jika ada.
+  let cursor = coll.find(filter, {_id: 1});
+  if (hint) cursor = cursor.hint(hint);
+  const ids = cursor.limit(batchSize).toArray().map(row => row._id);
   if (ids.length === 0) break;
-  const result = coll.deleteMany({_id: {$in: ids}}, {writeConcern: {w: "majority", wtimeout: 60000}});
+
+  // Defense-in-depth: validasi ulang tanggal dan maxId SAAT delete, bukan
+  // hanya pada saat mencari ID. Jika berubah, hentikan proses.
+  const guardedFilter = {$and: [dateFilter, {_id: {$lte: maxId}}, {_id: {$in: ids}}]};
+  const result = coll.deleteMany(guardedFilter, {writeConcern: {w: "majority", wtimeout: 60000}});
   total += result.deletedCount;
+  batches += 1;
   if (result.deletedCount !== ids.length) {
     console.error("DELETE_BATCH_MISMATCH\t" + ids.length + "\t" + result.deletedCount);
     quit(43);
   }
+  if (batches % 10 === 0) {
+    const duration = Math.max(1, Math.floor((Date.now() - started) / 1000));
+    console.error("DELETE_PROGRESS\tbatches=" + batches +
+                  "\tdeleted=" + total + "\tseconds=" + duration +
+                  "\tavg_docs_per_sec=" + Math.floor(total / duration));
+  }
 }
 const remaining = coll.countDocuments(filter);
+console.error("DELETE_PROFILE\tbatches=" + batches +
+              "\tduration_ms=" + (Date.now() - started));
 print("DELETED\t" + total + "\t" + remaining);
 if (remaining !== 0) quit(44);
 JS
@@ -587,13 +689,17 @@ process_range() {
         --collection="$collection" \
         --queryFile="$query_file" \
         --gzip \
-        --archive="$artifact"
+        --archive="$artifact" \
+        || die "DUMP gagal: $collection periode $range_label; data tidak dihapus"
+    [[ -s $artifact ]] \
+        || die "DUMP kosong/tidak ada: $artifact_name; data tidak dihapus"
     artifact_bytes=$(wc -c < "$artifact")
     log "DUMP: selesai $collection periode $range_label | ukuran=${artifact_bytes} byte | durasi=$((SECONDS - step_started)) detik"
 
     log "VERIFY: mulai gzip test + mongorestore dry-run untuk $artifact_name"
     step_started=$SECONDS
-    gzip -t "$artifact"
+    gzip -t "$artifact" \
+        || die "VERIFY gzip gagal: $artifact_name; data tidak dihapus"
     run_backup mongorestore \
         "${restore_connection[@]}" \
         --archive="$artifact" \
@@ -601,13 +707,15 @@ process_range() {
         --dryRun \
         --verbose \
         --nsInclude="${MONGO_ARCHIVE_DATABASE}.${collection}" \
-        >/dev/null
+        >/dev/null \
+        || die "VERIFY dry-run gagal: $artifact_name; data tidak dihapus"
     log "VERIFY: selesai $collection periode $range_label ($((SECONDS - step_started)) detik)"
 
     GCS_BACKUP_PATH="mongodb/archive/${safe_db}/${collection}/${year}"
     log "UPLOAD: mulai $artifact_name ke $GCS_URI$GCS_BACKUP_PATH/"
     step_started=$SECONDS
-    upload_backup "$artifact"
+    upload_backup "$artifact" \
+        || die "UPLOAD atau verifikasi GCS gagal: $artifact_name; data tidak dihapus"
     log "UPLOAD: selesai $collection periode $range_label ($((SECONDS - step_started)) detik)"
 
     if bool_value "$MONGO_ARCHIVE_DELETE_AFTER_UPLOAD"; then
