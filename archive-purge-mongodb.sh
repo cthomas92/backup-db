@@ -103,6 +103,13 @@ fi
 : "${MONGO_ARCHIVE_DELETE_BATCH_SIZE:=10000}"
 : "${MONGO_ARCHIVE_OLD_DATA_IMMUTABLE:=false}"
 : "${MONGO_ARCHIVE_WRITES_PAUSED:=false}"
+# Notifikasi progres per periode (mulai backup, upload, hapus) + ringkasan akhir.
+: "${MONGO_ARCHIVE_NOTIFY_PROGRESS:=true}"
+# Jeda minimum antar notifikasi (detik) agar tidak kena rate limit Telegram/Discord.
+: "${MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL:=3}"
+# Buat index {field_tanggal: 1} otomatis jika collection belum punya index
+# yang bisa dipakai untuk field archive (hanya pada --backup/--delete).
+: "${MONGO_ARCHIVE_AUTO_CREATE_INDEX:=true}"
 
 validate_bool_setting() {
     local name=$1
@@ -121,7 +128,9 @@ validate_bool_setting() {
 for name in \
     MONGO_TLS \
     MONGO_ARCHIVE_OLD_DATA_IMMUTABLE \
-    MONGO_ARCHIVE_WRITES_PAUSED
+    MONGO_ARCHIVE_WRITES_PAUSED \
+    MONGO_ARCHIVE_NOTIFY_PROGRESS \
+    MONGO_ARCHIVE_AUTO_CREATE_INDEX
 do
     validate_bool_setting "$name"
 done
@@ -143,6 +152,9 @@ done
 [[ $MONGO_ARCHIVE_DELETE_BATCH_SIZE =~ ^[1-9][0-9]*$ \
    && $MONGO_ARCHIVE_DELETE_BATCH_SIZE -le 100000 ]] \
     || die "MONGO_ARCHIVE_DELETE_BATCH_SIZE harus 1-100000"
+[[ $MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL =~ ^[0-9]+$ \
+   && $MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL -le 60 ]] \
+    || die "MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL harus 0-60"
 
 # Validasi target GCS sebelum membuat atau menghapus backup apa pun.
 if [[ $mode != check-years ]]; then
@@ -151,9 +163,12 @@ if [[ $mode != check-years ]]; then
         || die "GCS_URI harus berbentuk gs://nama-bucket/path/ dan diakhiri /"
 fi
 
-if [[ $mode != check-years ]] \
-   && ! mongorestore --help 2>&1 | grep -q -- '--dryRun'; then
-    die "mongorestore harus mendukung --dryRun untuk validasi archive"
+if [[ $mode != check-years ]]; then
+    # Tampung dulu output --help: "cmd | grep -q" + pipefail bisa gagal acak
+    # karena SIGPIPE saat grep berhenti lebih awal.
+    restore_help=$(mongorestore --help 2>&1 || true)
+    grep -q -- '--dryRun' <<<"$restore_help" \
+        || die "mongorestore harus mendukung --dryRun untuk validasi archive"
 fi
 
 collections=()
@@ -225,8 +240,299 @@ elif [[ $mode == backup ]]; then
     log "Mode --backup: data MongoDB tidak akan dihapus"
 fi
 
+# Akun untuk createIndex: MONGO_ARCHIVE_INDEX_* -> akun delete -> akun utama.
+if [[ -n ${MONGO_ARCHIVE_INDEX_USER:-} ]]; then
+    required MONGO_ARCHIVE_INDEX_PASSWORD
+    index_user=$MONGO_ARCHIVE_INDEX_USER
+    index_password=$MONGO_ARCHIVE_INDEX_PASSWORD
+    index_auth_db=${MONGO_ARCHIVE_INDEX_AUTH_DB:-$MONGO_AUTH_DB}
+elif [[ -n ${MONGO_ARCHIVE_DELETE_USER:-} && -n ${MONGO_ARCHIVE_DELETE_PASSWORD:-} ]]; then
+    index_user=$MONGO_ARCHIVE_DELETE_USER
+    index_password=$MONGO_ARCHIVE_DELETE_PASSWORD
+    index_auth_db=${MONGO_ARCHIVE_DELETE_AUTH_DB:-$MONGO_AUTH_DB}
+else
+    index_user=$MONGO_USER
+    index_password=$MONGO_PASSWORD
+    index_auth_db=$MONGO_AUTH_DB
+fi
+
 safe_db=${MONGO_ARCHIVE_DATABASE//[^a-zA-Z0-9_.-]/_}
 set_backup_name "mongodb-archive-${safe_db}"
+
+# ---------------------------------------------------------------------------
+# Notifikasi progres archive
+# ---------------------------------------------------------------------------
+
+# Statistik sesi, dihitung hanya untuk rentang yang benar-benar diproses.
+archive_run_started=$SECONDS
+archive_started_at=''
+archive_ranges_checked=0
+archive_ranges_empty=0
+archive_ranges_backed_up=0
+archive_documents_backed_up=0
+archive_documents_deleted=0
+archive_bytes_uploaded=0
+archive_period_details=()
+archive_collection_status=()
+archive_collections_skipped=0
+archive_indexes_created=0
+archive_warnings=()
+archive_current_period=''
+archive_current_step=''
+archive_notify_last_epoch=0
+
+archive_now() {
+    TZ="${NOTIFY_TIMEZONE:-Asia/Makassar}" date '+%d-%m-%Y %H:%M:%S %Z'
+}
+
+# 1234567 -> 1.234.567
+archive_format_count() {
+    local number=$1
+    local grouped=''
+
+    while (( ${#number} > 3 )); do
+        grouped=".${number: -3}${grouped}"
+        number=${number:0:${#number}-3}
+    done
+    printf '%s%s' "$number" "$grouped"
+}
+
+# 2023 -> Tahun 2023 | 2023-01 -> Januari 2023 | 2023-01-05 -> 5 Januari 2023
+archive_period_text() {
+    local label=$1
+    local -a months=(Januari Februari Maret April Mei Juni Juli Agustus September Oktober November Desember)
+
+    case ${#label} in
+        4)
+            printf 'Tahun %s' "$label"
+            ;;
+        7)
+            printf '%s %s' "${months[10#${label:5:2} - 1]}" "${label:0:4}"
+            ;;
+        10)
+            printf '%d %s %s' "$((10#${label:8:2}))" "${months[10#${label:5:2} - 1]}" "${label:0:4}"
+            ;;
+        *)
+            printf '%s' "$label"
+            ;;
+    esac
+}
+
+archive_mode_text() {
+    case $mode in
+        delete)
+            printf -- '--delete (backup, upload, lalu hapus)'
+            ;;
+        *)
+            printf -- '--backup (tanpa hapus data)'
+            ;;
+    esac
+}
+
+# Kirim satu pesan ke Discord/Telegram dengan judul bebas.
+# Tidak pernah menggagalkan proses archive.
+archive_notify() {
+    local title=$1
+    local color=$2
+    local message=$3
+    local payload
+    local now
+    local wait_seconds
+
+    bool_value "${NOTIFY_DISCORD:-false}" \
+        || bool_value "${NOTIFY_TELEGRAM:-false}" \
+        || return 0
+
+    # Telegram/Discord menolak pesan > 4096 karakter. Dengan LC_ALL=C panjang
+    # dihitung dalam byte (>= jumlah karakter), lalu dipotong di akhir baris
+    # supaya karakter UTF-8/emoji tidak terbelah.
+    if (( ${#message} > 3500 )); then
+        message=${message:0:3500}
+        message=${message%$'\n'*}
+        message+=$'\n\n'"… (pesan dipotong; detail lengkap di log ${LOG_FILE:-$LOG_DIR})"
+    fi
+
+    now=$(date +%s)
+    wait_seconds=$((archive_notify_last_epoch + MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL - now))
+    if (( wait_seconds > 0 )); then
+        sleep "$wait_seconds"
+    fi
+
+    if bool_value "${NOTIFY_DISCORD:-false}" && [[ -n ${DISCORD_WEBHOOK_URL:-} ]]; then
+        payload=$(
+            printf '{"username":"DB Backup Monitor","allowed_mentions":{"parse":[]},"embeds":[{"title":"%s","description":"%s","color":%s,"timestamp":"%s","footer":{"text":"MongoDB Archive Monitoring"}}]}' \
+                "$(json_escape "$title")" \
+                "$(json_escape "$message")" \
+                "$color" \
+                "$(date -u +%FT%TZ)"
+        )
+        if retry_cmd 3 3 "Notifikasi Discord" _notify_discord_once "$payload"; then
+            :
+        else
+            log "WARNING: Notifikasi Discord gagal dikirim: $title"
+        fi
+    fi
+
+    if bool_value "${NOTIFY_TELEGRAM:-false}" \
+       && [[ -n ${TELEGRAM_BOT_TOKEN:-} && -n ${TELEGRAM_CHAT_ID:-} ]]; then
+        if retry_cmd 3 3 "Notifikasi Telegram" _notify_telegram_once \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            "<b>$(html_escape "$title")</b>
+
+$(html_escape "$message")"; then
+            :
+        else
+            log "WARNING: Notifikasi Telegram gagal dikirim: $title"
+        fi
+    fi
+
+    archive_notify_last_epoch=$(date +%s)
+    return 0
+}
+
+# Notifikasi progres per periode; bisa dimatikan lewat MONGO_ARCHIVE_NOTIFY_PROGRESS=false.
+archive_progress_notify() {
+    bool_value "$MONGO_ARCHIVE_NOTIFY_PROGRESS" || return 0
+    archive_notify "$@" || true
+}
+
+archive_send_summary() {
+    local rc=$1
+    local title
+    local color
+    local message
+    local line
+    local details=''
+    local shown=0
+    local hidden=0
+    local error
+
+    if (( rc == 0 && ${#archive_warnings[@]} > 0 )); then
+        bool_value "${NOTIFY_ON_WARNING:-true}" || return 0
+        title='⚠️ MONGODB ARCHIVE SELESAI DENGAN PERINGATAN — RINGKASAN'
+        color=16705372
+    elif (( rc == 0 )); then
+        bool_value "${NOTIFY_ON_SUCCESS:-true}" || return 0
+        if [[ $mode == delete ]]; then
+            title='✅ MONGODB ARCHIVE SELESAI — RINGKASAN'
+        else
+            title='✅ MONGODB BACKUP ARCHIVE SELESAI — RINGKASAN'
+        fi
+        color=5763719
+    else
+        bool_value "${NOTIFY_ON_FAILURE:-true}" || return 0
+        title='❌ MONGODB ARCHIVE GAGAL — RINGKASAN'
+        color=15548997
+    fi
+
+    message="🖥 Host
+$(backup_display_host)
+
+🗄 Database
+$MONGO_ARCHIVE_DATABASE
+
+🔧 Mode
+$(archive_mode_text)"
+
+    # Saat gagal, error ditaruh paling atas agar tidak ikut terpotong.
+    if (( rc != 0 )); then
+        error=${BACKUP_LAST_ERROR:-}
+        [[ -n $error ]] || error="Proses berhenti (exit code $rc)"
+        message+=$'\n\n'"❌ Error
+$error"
+        if [[ -n $archive_current_period ]]; then
+            message+=$'\n\n'"📍 Berhenti pada
+$archive_current_period (tahap ${archive_current_step:-?})"
+        fi
+        message+=$'\n\n'"Exit code: $rc"
+    fi
+
+    if (( ${#archive_collection_status[@]} > 0 )); then
+        message+=$'\n\n'"📚 Status collection"
+        for line in "${archive_collection_status[@]}"; do
+            message+=$'\n'"$line"
+        done
+    fi
+
+    message+=$'\n\n'"📊 Hasil
+Collection dilewati: $(archive_format_count "$archive_collections_skipped")
+Index dibuat       : $(archive_format_count "$archive_indexes_created")
+Periode dicek      : $(archive_format_count "$archive_ranges_checked")
+Periode kosong     : $(archive_format_count "$archive_ranges_empty")
+Periode di-backup  : $(archive_format_count "$archive_ranges_backed_up")
+Dokumen di-backup  : $(archive_format_count "$archive_documents_backed_up")
+Dokumen dihapus    : $(archive_format_count "$archive_documents_deleted")
+Total ukuran upload: $(human_bytes "$archive_bytes_uploaded")"
+
+    # Batasi panjang rincian agar muat di Telegram/Discord (maks ~4096 karakter).
+    for line in "${archive_period_details[@]}"; do
+        if (( ${#details} + ${#line} > 1000 )); then
+            hidden=$((hidden + 1))
+            continue
+        fi
+        details+=$'\n'"• $line"
+        shown=$((shown + 1))
+    done
+    if (( shown > 0 )); then
+        message+=$'\n\n'"🧾 Rincian per periode${details}"
+        if (( hidden > 0 )); then
+            message+=$'\n'"… dan $hidden periode lain (lihat log)"
+        fi
+    fi
+
+    message+=$'\n\n'"☁️ GCS
+${GCS_URI}mongodb/archive/${safe_db}/
+
+⏱ Durasi
+$(format_duration "$((SECONDS - archive_run_started))")
+
+🕒 Mulai
+${archive_started_at:-?}
+
+🕒 Selesai
+$(archive_now)"
+
+    if (( ${#archive_warnings[@]} > 0 )); then
+        message+=$'\n\n'"⚠️ Peringatan (${#archive_warnings[@]})"
+        shown=0
+        for line in "${archive_warnings[@]}"; do
+            if (( shown == 5 )); then
+                message+=$'\n'"… dan $(( ${#archive_warnings[@]} - 5 )) peringatan lain (lihat log)"
+                break
+            fi
+            message+=$'\n'"• $line"
+            shown=$((shown + 1))
+        done
+    fi
+
+    if (( rc != 0 )); then
+        if [[ -n ${RUN_DIR:-} && -d ${RUN_DIR:-} ]]; then
+            message+=$'\n\n'"📁 Local staging
+$RUN_DIR"
+        fi
+        message+=$'\n\n'"🔎 Log
+${LOG_FILE:-$LOG_DIR}"
+    fi
+
+    archive_notify "$title" "$color" "$message" || true
+}
+
+# Kirim ringkasan archive sebagai notifikasi akhir, lalu serahkan ke handler
+# bawaan lib/common.bash (cleanup + exit code asli) tanpa notifikasi ganda.
+archive_finalize() {
+    local rc=$?
+
+    trap - EXIT
+    set +e
+    archive_send_summary "$rc"
+    BACKUP_SUPPRESS_STANDALONE_NOTIFY=1
+    archive_return_status "$rc"
+    finalize_backup_script
+}
+
+archive_return_status() {
+    return "$1"
+}
 
 if [[ $mode == check-years ]]; then
     secure_dir "$BACKUP_DIR"
@@ -239,6 +545,8 @@ if [[ $mode == check-years ]]; then
     log "Pemeriksaan tahun MongoDB (read-only)"
 else
     begin_backup
+    archive_started_at=$(archive_now)
+    trap archive_finalize EXIT
 fi
 
 # Tampilkan sasaran yang benar-benar dibaca dari .env (tanpa kredensial).
@@ -321,14 +629,21 @@ const dateFilter = {[field]: {$gte: new Date(e.ARCHIVE_START), $lt: new Date(e.A
 
 // Pilih hanya index satu-field yang persis sesuai filter; hindari hint palsu.
 // Jika tidak ada atau metadata index tak dapat dibaca, biarkan query planner memilih.
+// Index yang diawali field archive (single atau compound, semua key 1/-1).
+// Utamakan index dengan jumlah key paling sedikit.
+function usableDateIndex() {
+  const list = coll.getIndexes().filter(item => {
+    const fields = Object.keys(item.key || {});
+    return fields.length >= 1 && fields[0] === field &&
+           fields.every(name => item.key[name] === 1 || item.key[name] === -1) &&
+           item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
+  });
+  list.sort((a, b) => Object.keys(a.key).length - Object.keys(b.key).length);
+  return list.length ? list[0] : null;
+}
 function dateIndexHint() {
   try {
-    const index = coll.getIndexes().find(item => {
-      const fields = Object.keys(item.key || {});
-      return fields.length === 1 && fields[0] === field &&
-             (item.key[field] === 1 || item.key[field] === -1) &&
-             item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
-    });
+    const index = usableDateIndex();
     return index ? {hint: index.name} : {};
   } catch (error) {
     console.error("WARN_INDEX_HINT\t" + error.message);
@@ -408,14 +723,21 @@ if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100000) {
 }
 const dateFilter = {[field]: {$gte: new Date(e.ARCHIVE_START), $lt: new Date(e.ARCHIVE_END)}};
 const filter = {$and: [dateFilter, {_id: {$lte: maxId}}]};
+// Index yang diawali field archive (single atau compound, semua key 1/-1).
+// Utamakan index dengan jumlah key paling sedikit.
+function usableDateIndex() {
+  const list = coll.getIndexes().filter(item => {
+    const fields = Object.keys(item.key || {});
+    return fields.length >= 1 && fields[0] === field &&
+           fields.every(name => item.key[name] === 1 || item.key[name] === -1) &&
+           item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
+  });
+  list.sort((a, b) => Object.keys(a.key).length - Object.keys(b.key).length);
+  return list.length ? list[0] : null;
+}
 function dateIndexHint() {
   try {
-    const index = coll.getIndexes().find(item => {
-      const fields = Object.keys(item.key || {});
-      return fields.length === 1 && fields[0] === field &&
-             (item.key[field] === 1 || item.key[field] === -1) &&
-             item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
-    });
+    const index = usableDateIndex();
     return index ? index.name : null;
   } catch (error) {
     console.error("WARN_INDEX_HINT\t" + error.message);
@@ -439,7 +761,10 @@ while (true) {
   const result = coll.deleteMany(guardedFilter, {writeConcern: {w: "majority", wtimeout: 60000}});
   total += result.deletedCount;
   batches += 1;
-  if (result.deletedCount !== ids.length) {
+  // Collection ber-TTL: MongoDB boleh menghapus dokumen yang sama lebih dulu
+  // (selisih hanya boleh berkurang, tidak pernah bertambah).
+  if (result.deletedCount !== ids.length &&
+      !(e.ARCHIVE_ALLOW_SHRINK === "1" && result.deletedCount < ids.length)) {
     console.error("DELETE_BATCH_MISMATCH\t" + ids.length + "\t" + result.deletedCount);
     quit(43);
   }
@@ -457,7 +782,90 @@ print("DELETED\t" + total + "\t" + remaining);
 if (remaining !== 0) quit(44);
 JS
 
-chmod 600 "$list_years_js" "$boundary_js" "$count_js" "$delete_js"
+inspect_js="$RUN_DIR/inspect.js"
+create_index_js="$RUN_DIR/create-index.js"
+oldest_js="$RUN_DIR/oldest.js"
+year_check_js="$RUN_DIR/year-check.js"
+
+# Header bersama: autentikasi + pemilihan index field archive.
+archive_js_header=$(cat <<'JS'
+const e = process.env;
+const auth = db.getSiblingDB(e.ARCHIVE_AUTH_DB);
+try { auth.auth({user: e.ARCHIVE_USER, pwd: e.ARCHIVE_PASSWORD}); }
+catch (error) { console.error(error.message); quit(18); }
+const target = db.getSiblingDB(e.ARCHIVE_DATABASE);
+const coll = target.getCollection(e.ARCHIVE_COLLECTION);
+const field = e.ARCHIVE_DATE_FIELD;
+function clean(text) { return String(text).replace(/[\t\r\n]+/g, " "); }
+function usableDateIndex(indexes) {
+  const list = indexes.filter(item => {
+    const fields = Object.keys(item.key || {});
+    return fields.length >= 1 && fields[0] === field &&
+           fields.every(name => item.key[name] === 1 || item.key[name] === -1) &&
+           item.hidden !== true && !item.partialFilterExpression && item.sparse !== true;
+  });
+  list.sort((a, b) => Object.keys(a.key).length - Object.keys(b.key).length);
+  return list.length ? list[0] : null;
+}
+function dateIndexName() {
+  try { const index = usableDateIndex(coll.getIndexes()); return index ? index.name : null; }
+  catch (error) { console.error("WARN_INDEX_HINT\t" + clean(error.message)); return null; }
+}
+JS
+)
+
+# INSPECT  MISSING | NOT_COLLECTION <type> | OK <estimasi> <index|-> <ttl|->
+{ printf '%s\n' "$archive_js_header"; cat <<'JS'; } >"$inspect_js"
+const infos = target.getCollectionInfos({name: e.ARCHIVE_COLLECTION});
+if (infos.length === 0) { print("INSPECT\tMISSING"); quit(0); }
+const type = infos[0].type || "collection";
+if (type !== "collection") { print("INSPECT\tNOT_COLLECTION\t" + clean(type)); quit(0); }
+const estimated = coll.estimatedDocumentCount();
+let indexes = [];
+try { indexes = coll.getIndexes(); }
+catch (error) { console.error("WARN_INDEX_LIST\t" + clean(error.message)); }
+const index = usableDateIndex(indexes);
+const ttl = indexes.filter(item => item.expireAfterSeconds !== undefined)
+  .map(item => item.name + "=" + item.expireAfterSeconds + "s");
+print("INSPECT\tOK\t" + estimated + "\t" + (index ? index.name : "-") + "\t" + (ttl.join(",") || "-"));
+JS
+
+# INDEX_CREATED <nama> | INDEX_FAILED <pesan>
+{ printf '%s\n' "$archive_js_header"; cat <<'JS'; } >"$create_index_js"
+try {
+  const name = coll.createIndex({[field]: 1});
+  print("INDEX_CREATED\t" + clean(name));
+} catch (error) {
+  const text = clean((error.codeName ? error.codeName + ": " : "") + error.message);
+  print("INDEX_FAILED\t" + text.replace(/ to execute command .*/, "").slice(0, 200));
+}
+JS
+
+# OLDEST <ISO> | OLDEST NONE  (dokumen BSON Date paling tua)
+{ printf '%s\n' "$archive_js_header"; cat <<'JS'; } >"$oldest_js"
+const hint = dateIndexName();
+let cursor = coll.find({[field]: {$type: "date"}}, {[field]: 1}).sort({[field]: 1}).limit(1);
+if (hint) cursor = cursor.hint(hint);
+const doc = cursor.toArray()[0];
+if (!doc) { print("OLDEST\tNONE"); quit(0); }
+const value = field.split(".").reduce((obj, key) => (obj == null ? undefined : obj[key]), doc);
+if (!(value instanceof Date)) { console.error("OLDEST_NOT_DATE"); quit(48); }
+print("OLDEST\t" + value.toISOString());
+JS
+
+# YEAR_DATA <tahun> <1|0> untuk setiap "tahun|awal|akhir" di ARCHIVE_YEAR_RANGES.
+{ printf '%s\n' "$archive_js_header"; cat <<'JS'; } >"$year_check_js"
+const hint = dateIndexName();
+for (const part of e.ARCHIVE_YEAR_RANGES.split(";")) {
+  const [year, start, end] = part.split("|");
+  let cursor = coll.find({[field]: {$gte: new Date(start), $lt: new Date(end)}}, {_id: 1}).limit(1);
+  if (hint) cursor = cursor.hint(hint);
+  print("YEAR_DATA\t" + year + "\t" + (cursor.hasNext() ? 1 : 0));
+}
+JS
+
+chmod 600 "$list_years_js" "$boundary_js" "$count_js" "$delete_js" \
+    "$inspect_js" "$create_index_js" "$oldest_js" "$year_check_js"
 
 run_mongosh_script() {
     local user=$1
@@ -488,6 +896,9 @@ run_mongosh_with_progress() {
     chmod 600 "$output_file"
 
     (
+        # Jangan warisi file lock (fd 9): proses sleep yang tersisa setelah
+        # timer dihentikan tidak boleh menahan lock run berikutnya.
+        exec 9>&-
         while sleep 30; do
             log "WAIT: $step_label masih berjalan ($((SECONDS - started)) detik); menunggu respons MongoDB..." >&2
         done
@@ -508,6 +919,213 @@ run_mongosh_with_progress() {
     fi
     rm -f -- "$output_file"
     return "$rc"
+}
+
+# Hasil inspect_collection (global, berlaku untuk collection yang sedang diproses).
+collection_state=''       # OK | MISSING | NOT_COLLECTION
+collection_type=''
+collection_estimated=0
+collection_index='-'
+collection_ttl='-'
+
+inspect_collection() {
+    local collection=$1
+    local date_field=$2
+    local output
+    local line
+
+    export ARCHIVE_COLLECTION=$collection
+    export ARCHIVE_DATE_FIELD=$date_field
+
+    output=$(run_mongosh_with_progress "inspect $collection" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$inspect_js") \
+        || die "Gagal memeriksa collection $collection"
+    line=$(awk -F '\t' '$1 == "INSPECT" {print; exit}' <<<"$output")
+    [[ -n $line ]] || die "Hasil pemeriksaan collection $collection tidak valid"
+
+    collection_type=''
+    collection_estimated=0
+    collection_index='-'
+    collection_ttl='-'
+    IFS=$'\t' read -r _ collection_state <<<"$line"
+    collection_state=${collection_state%%$'\t'*}
+    case $collection_state in
+        MISSING)
+            ;;
+        NOT_COLLECTION)
+            IFS=$'\t' read -r _ _ collection_type <<<"$line"
+            ;;
+        OK)
+            IFS=$'\t' read -r _ _ collection_estimated collection_index collection_ttl <<<"$line"
+            [[ $collection_estimated =~ ^[0-9]+$ ]] \
+                || die "Estimasi jumlah dokumen $collection tidak valid"
+            ;;
+        *)
+            die "Status collection $collection tidak dikenal: $collection_state"
+            ;;
+    esac
+}
+
+archive_warn() {
+    archive_warnings+=("$1")
+    mark_warning "$1"
+}
+
+skip_collection() {
+    local collection=$1
+    local reason=$2
+
+    archive_collections_skipped=$((archive_collections_skipped + 1))
+    archive_collection_status+=("⏭ $collection: dilewati — $reason")
+    log "SKIP COLLECTION: $collection — $reason"
+    archive_progress_notify '⏭ MONGODB ARCHIVE — COLLECTION DILEWATI' 9807270 "🗄 Collection
+${MONGO_ARCHIVE_DATABASE}.${collection}
+
+ℹ️ Alasan
+$reason
+
+🕒 Waktu
+$(archive_now)"
+}
+
+# Pastikan field archive punya index; buat {field: 1} jika belum ada.
+# Gagal membuat index = peringatan (proses tetap jalan, hanya lebih lambat).
+ensure_date_index() {
+    local collection=$1
+    local date_field=$2
+    local output
+    local status
+    local detail
+    local started=$SECONDS
+    local target_text="${MONGO_ARCHIVE_DATABASE}.${collection}"
+
+    if [[ $collection_index != - ]]; then
+        log "INDEX: $collection memakai index $collection_index untuk $date_field"
+        return 0
+    fi
+
+    if ! bool_value "$MONGO_ARCHIVE_AUTO_CREATE_INDEX"; then
+        archive_warn "$collection: tidak ada index untuk $date_field (MONGO_ARCHIVE_AUTO_CREATE_INDEX=false); proses bisa sangat lambat"
+        return 0
+    fi
+
+    archive_current_step=INDEX
+    log "INDEX: membuat index {$date_field: 1} pada $collection (±$collection_estimated dokumen)"
+    archive_progress_notify '🛠 MONGODB ARCHIVE — MEMBUAT INDEX' 3447003 "🗄 Collection
+$target_text
+
+🔑 Index
+{ $date_field: 1 }
+
+📊 Perkiraan data
+$(archive_format_count "$collection_estimated") dokumen
+
+ℹ️ Keterangan
+Index belum ada; dibuat dulu sebelum backup/hapus.
+
+🕒 Mulai
+$(archive_now)"
+
+    export ARCHIVE_COLLECTION=$collection
+    export ARCHIVE_DATE_FIELD=$date_field
+    if output=$(run_mongosh_with_progress "create index $collection.$date_field" \
+        "$index_user" "$index_password" "$index_auth_db" "$create_index_js"); then
+        IFS=$'\t' read -r status detail \
+            <<<"$(awk -F '\t' '$1 ~ /^INDEX_/ {print; exit}' <<<"$output")"
+    else
+        status=INDEX_FAILED
+        detail="mongosh gagal (cek hak akses createIndex untuk user $index_user)"
+    fi
+
+    if [[ $status == INDEX_CREATED && -n $detail ]]; then
+        collection_index=$detail
+        archive_indexes_created=$((archive_indexes_created + 1))
+        log "INDEX: selesai $detail pada $collection ($((SECONDS - started)) detik)"
+        archive_progress_notify '✅ MONGODB ARCHIVE — INDEX BERHASIL DIBUAT' 5763719 "🗄 Collection
+$target_text
+
+🔑 Index
+$detail
+
+⏱ Durasi
+$(format_duration "$((SECONDS - started))")
+
+🕒 Selesai
+$(archive_now)"
+    else
+        archive_warn "$collection: index {$date_field: 1} gagal dibuat: ${detail:-tanpa keterangan}; proses tetap jalan tanpa index"
+        archive_progress_notify '⚠️ MONGODB ARCHIVE — INDEX GAGAL DIBUAT' 16705372 "🗄 Collection
+$target_text
+
+❌ Error
+${detail:-tanpa keterangan}
+
+ℹ️ Keterangan
+Proses tetap dilanjutkan tanpa index (lebih lambat)."
+    fi
+}
+
+# Bangun "tahun|awal|akhir;..." sesuai MONGO_ARCHIVE_TIMEZONE.
+build_year_ranges() {
+    local year
+    local ranges=''
+    local start
+    local end
+
+    for year in "$@"; do
+        start=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date --iso-8601=seconds -d "$year-01-01 00:00:00")
+        end=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date --iso-8601=seconds -d "$((10#$year + 1))-01-01 00:00:00")
+        ranges+="${ranges:+;}$year|$start|$end"
+    done
+    printf '%s' "$ranges"
+}
+
+# Isi array years_with_data dengan kandidat tahun yang benar-benar berisi data.
+filter_years_with_data() {
+    local collection=$1
+    local date_field=$2
+    shift 2
+    local output
+
+    years_with_data=()
+    (( $# > 0 )) || return 0
+
+    export ARCHIVE_COLLECTION=$collection
+    export ARCHIVE_DATE_FIELD=$date_field
+    ARCHIVE_YEAR_RANGES=$(build_year_ranges "$@")
+    export ARCHIVE_YEAR_RANGES
+
+    output=$(run_mongosh_with_progress "cek data per tahun $collection" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$year_check_js") \
+        || die "Gagal memeriksa data per tahun pada $collection"
+    mapfile -t years_with_data < <(
+        awk -F '\t' '$1 == "YEAR_DATA" && $2 ~ /^[0-9]{4}$/ && $3 == "1" {print $2}' \
+            <<<"$output" | sort -nu
+    )
+}
+
+# Tahun paling tua (zona MONGO_ARCHIVE_TIMEZONE) yang punya BSON Date; kosong jika tidak ada.
+oldest_year() {
+    local collection=$1
+    local date_field=$2
+    local output
+    local oldest
+
+    export ARCHIVE_COLLECTION=$collection
+    export ARCHIVE_DATE_FIELD=$date_field
+    output=$(run_mongosh_with_progress "cari data tertua $collection" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$oldest_js") \
+        || die "Gagal mencari data tertua pada $collection"
+    oldest=$(awk -F '\t' '$1 == "OLDEST" {print $2; exit}' <<<"$output")
+    [[ -n $oldest && $oldest != NONE ]] || return 0
+    # toISOString: YYYY-MM-DDTHH:MM:SS.sssZ; tahun < 1900 / format lain
+    # (mis. tanggal sampah) dimulai dari 1900 agar daftar tahun tetap wajar.
+    if [[ $oldest =~ ^(19|20)[0-9]{2}- ]]; then
+        TZ="$MONGO_ARCHIVE_TIMEZONE" date -d "$oldest" +%Y
+    else
+        log "WARNING: $collection punya tanggal tidak wajar ($oldest); pencarian tahun dimulai dari 1900"
+        printf '1900'
+    fi
 }
 
 report_available_years() {
@@ -532,18 +1150,53 @@ report_available_years() {
     for index in "${!collections[@]}"; do
         collection=${collections[$index]}
         date_field=${date_fields[$index]}
+        inspect_collection "$collection" "$date_field"
+        case $collection_state in
+            MISSING)
+                printf '%s (%s): collection TIDAK ADA, akan dilewati\n\n' "$collection" "$date_field"
+                continue
+                ;;
+            NOT_COLLECTION)
+                printf '%s (%s): bukan collection biasa (%s), akan dilewati\n\n' "$collection" "$date_field" "$collection_type"
+                continue
+                ;;
+        esac
+        if (( collection_estimated == 0 )); then
+            printf '%s (%s): collection kosong, akan dilewati\n\n' "$collection" "$date_field"
+            continue
+        fi
+        printf '%s (%s): ±%s dokumen | index: %s | TTL: %s\n' \
+            "$collection" "$date_field" "$(archive_format_count "$collection_estimated")" \
+            "$([[ $collection_index == - ]] && printf 'BELUM ADA (dibuat otomatis saat --backup/--delete)' || printf '%s' "$collection_index")" \
+            "$collection_ttl"
+
         export ARCHIVE_COLLECTION=$collection
         export ARCHIVE_DATE_FIELD=$date_field
 
         log "CHECK: mencari tahun untuk $collection (field: $date_field)"
-        output=$(run_mongosh_with_progress "daftar tahun $collection" \
-            "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
-            || die "Gagal memeriksa tahun pada $collection"
-
-        mapfile -t found_years < <(
-            awk -F '\t' '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ {print $2}' \
-                <<<"$output" | sort -nu
-        )
+        found_years=()
+        if [[ $collection_index != - ]]; then
+            # Cepat via index: data tertua, lalu satu query per tahun.
+            first_year=$(oldest_year "$collection" "$date_field") \
+                || die "Gagal mencari data tertua pada $collection"
+            if [[ -n $first_year ]]; then
+                candidate_years=()
+                for (( year = 10#$first_year; year <= 10#$current_year; year++ )); do
+                    candidate_years+=("$year")
+                done
+                filter_years_with_data "$collection" "$date_field" "${candidate_years[@]}"
+                found_years=("${years_with_data[@]}")
+            fi
+        else
+            # Tanpa index: satu kali scan penuh lebih murah daripada banyak query.
+            output=$(run_mongosh_with_progress "daftar tahun $collection" \
+                "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
+                || die "Gagal memeriksa tahun pada $collection"
+            mapfile -t found_years < <(
+                awk -F '\t' '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ {print $2}' \
+                    <<<"$output" | sort -nu
+            )
+        fi
 
         if (( ${#found_years[@]} == 0 )); then
             printf '%s (%s): tidak ada BSON Date\n\n' "$collection" "$date_field"
@@ -607,14 +1260,6 @@ check_free_space() {
         || die "Free space kurang dari ${MONGO_ARCHIVE_MIN_FREE_GB} GB; kecilkan MONGO_ARCHIVE_CHUNK"
 }
 
-# Statistik sesi, dihitung hanya untuk rentang yang benar-benar diproses.
-archive_run_started=$SECONDS
-archive_ranges_checked=0
-archive_ranges_empty=0
-archive_ranges_backed_up=0
-archive_documents_backed_up=0
-archive_documents_deleted=0
-
 process_range() {
     local collection=$1
     local date_field=$2
@@ -639,6 +1284,18 @@ process_range() {
     local range_started=$SECONDS
     local step_started
     local artifact_bytes
+    local period_text
+    local target_text
+    local prepare_seconds
+    local delete_started_at
+    local delete_finished_at
+    local detail
+    local allow_shrink=0
+
+    period_text=$(archive_period_text "$range_label")
+    target_text="${MONGO_ARCHIVE_DATABASE}.${collection}"
+    archive_current_period="$target_text | $period_text"
+    archive_current_step=BOUNDARY
 
     archive_ranges_checked=$((archive_ranges_checked + 1))
     log "CHECK: $collection periode $range_label | field=$date_field | rentang=$range_start_local s.d. $range_end_local (akhir eksklusif) | zona=$MONGO_ARCHIVE_TIMEZONE"
@@ -659,6 +1316,8 @@ process_range() {
     if grep -qx 'EMPTY' <<<"$boundary_output"; then
         archive_ranges_empty=$((archive_ranges_empty + 1))
         log "SKIP: $collection periode $range_label kosong (cek $((SECONDS - step_started)) detik; total $((SECONDS - range_started)) detik)"
+        archive_current_period=''
+        archive_current_step=''
         return 0
     fi
 
@@ -669,6 +1328,22 @@ process_range() {
     [[ $expected_count =~ ^[1-9][0-9]*$ ]] || die "Jumlah dokumen boundary tidak valid"
     log "FOUND: $collection periode $range_label | $expected_count dokumen (cek $((SECONDS - step_started)) detik)"
 
+    archive_progress_notify '📦 MONGODB ARCHIVE — MULAI BACKUP' 3447003 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+📊 Total data
+$(archive_format_count "$expected_count") dokumen
+
+🔧 Mode
+$(archive_mode_text)
+
+🕒 Mulai
+$(archive_now)"
+
+    archive_current_step=DUMP
     check_free_space
 
     query_file="$RUN_DIR/query-${collection}-${range_label}.json"
@@ -697,6 +1372,7 @@ process_range() {
     log "DUMP: selesai $collection periode $range_label | ukuran=${artifact_bytes} byte | durasi=$((SECONDS - step_started)) detik"
 
     log "VERIFY: mulai gzip test + mongorestore dry-run untuk $artifact_name"
+    archive_current_step=VERIFY
     step_started=$SECONDS
     gzip -t "$artifact" \
         || die "VERIFY gzip gagal: $artifact_name; data tidak dihapus"
@@ -712,26 +1388,107 @@ process_range() {
     log "VERIFY: selesai $collection periode $range_label ($((SECONDS - step_started)) detik)"
 
     GCS_BACKUP_PATH="mongodb/archive/${safe_db}/${collection}/${year}"
+    prepare_seconds=$((SECONDS - range_started))
+    archive_progress_notify '☁️ MONGODB ARCHIVE — PROSES UPLOAD' 3447003 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+📊 Total data
+$(archive_format_count "$expected_count") dokumen
+
+📦 File
+$artifact_name
+($(human_bytes "$artifact_bytes"), dump + verifikasi $(format_duration "$prepare_seconds"))
+
+☁️ Tujuan
+$GCS_URI$GCS_BACKUP_PATH/
+
+🕒 Mulai upload
+$(archive_now)"
+
     log "UPLOAD: mulai $artifact_name ke $GCS_URI$GCS_BACKUP_PATH/"
+    archive_current_step=UPLOAD
     step_started=$SECONDS
     upload_backup "$artifact" \
         || die "UPLOAD atau verifikasi GCS gagal: $artifact_name; data tidak dihapus"
     log "UPLOAD: selesai $collection periode $range_label ($((SECONDS - step_started)) detik)"
+    archive_bytes_uploaded=$((archive_bytes_uploaded + artifact_bytes))
+
+    if bool_value "$MONGO_ARCHIVE_DELETE_AFTER_UPLOAD"; then
+        detail='data dihapus setelah ini'
+    else
+        detail='data MongoDB TIDAK dihapus (mode --backup)'
+    fi
+    archive_progress_notify '✅ MONGODB ARCHIVE — UPLOAD BERHASIL' 5763719 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+📊 Total data
+$(archive_format_count "$expected_count") dokumen
+
+☁️ GCS (uploaded & verified)
+$BACKUP_REMOTE_URI
+
+📦 Ukuran
+$(human_bytes "$artifact_bytes")
+
+⏱ Durasi upload
+$(format_duration "$((SECONDS - step_started))")
+
+🕒 Selesai
+$(archive_now)
+
+ℹ️ Keterangan
+$detail"
 
     if bool_value "$MONGO_ARCHIVE_DELETE_AFTER_UPLOAD"; then
         export ARCHIVE_MAX_ID=$max_id
         log "RECOUNT: cek ulang jumlah dokumen sebelum delete $collection periode $range_label"
+        archive_current_step=RECOUNT
         step_started=$SECONDS
         count_output=$(run_mongosh_with_progress "recount $collection $range_label" \
             "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$count_js") \
             || die "Gagal memeriksa ulang jumlah dokumen $collection $range_label"
         current_count=$(awk -F '\t' '$1 == "ARCHIVE_COUNT" {print $2; exit}' <<<"$count_output")
         [[ $current_count =~ ^[0-9]+$ ]] || die "Hasil recount tidak valid"
-        [[ $current_count == "$expected_count" ]] \
-            || die "Jumlah dokumen berubah setelah backup ($expected_count menjadi $current_count); data tidak dihapus"
-        log "RECOUNT: sesuai ($current_count dokumen; $((SECONDS - step_started)) detik)"
+        allow_shrink=0
+        if [[ $current_count == "$expected_count" ]]; then
+            log "RECOUNT: sesuai ($current_count dokumen; $((SECONDS - step_started)) detik)"
+        elif [[ $collection_ttl != - ]] && (( current_count < expected_count )); then
+            # TTL MongoDB sudah menghapus sebagian dokumen yang ada di backup.
+            # Sisanya tetap bagian dari backup, jadi aman dihapus.
+            allow_shrink=1
+            log "RECOUNT: berkurang $expected_count -> $current_count karena TTL ($collection_ttl); lanjut hapus sisa"
+        else
+            die "Jumlah dokumen berubah setelah backup ($expected_count menjadi $current_count); data tidak dihapus"
+        fi
+        export ARCHIVE_ALLOW_SHRINK=$allow_shrink
+
+        delete_started_at=$(archive_now)
+        archive_progress_notify '🗑 MONGODB ARCHIVE — PROSES PENGHAPUSAN' 16705372 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+📊 Total yang akan dihapus
+$(archive_format_count "$current_count") dokumen $(if (( allow_shrink == 1 )); then printf '(backup %s; selisih sudah dihapus TTL MongoDB)' "$(archive_format_count "$expected_count")"; else printf '(sudah di-recount, sesuai backup)'; fi)
+
+☁️ Backup GCS
+$BACKUP_REMOTE_URI
+
+⚙️ Batch
+$(archive_format_count "$MONGO_ARCHIVE_DELETE_BATCH_SIZE") dokumen per batch
+
+🕒 Mulai hapus
+$delete_started_at"
 
         log "DELETE: mulai $collection periode $range_label (batch $MONGO_ARCHIVE_DELETE_BATCH_SIZE)"
+        archive_current_step=DELETE
         step_started=$SECONDS
         delete_output=$(run_mongosh_with_progress "delete $collection $range_label" \
             "$MONGO_ARCHIVE_DELETE_USER" \
@@ -741,19 +1498,50 @@ process_range() {
 
         IFS=$'\t' read -r _ deleted_count remaining_count \
             <<<"$(awk -F '\t' '$1 == "DELETED" {print; exit}' <<<"$delete_output")"
-        [[ $deleted_count == "$expected_count" && $remaining_count == 0 ]] \
+        [[ $deleted_count =~ ^[0-9]+$ && $remaining_count == 0 ]] \
             || die "Verifikasi penghapusan gagal untuk $collection $range_label"
+        if (( allow_shrink == 1 )); then
+            (( deleted_count <= current_count )) \
+                || die "Verifikasi penghapusan gagal untuk $collection $range_label"
+        else
+            [[ $deleted_count == "$expected_count" ]] \
+                || die "Verifikasi penghapusan gagal untuk $collection $range_label"
+        fi
 
         archive_documents_deleted=$((archive_documents_deleted + deleted_count))
+        delete_finished_at=$(archive_now)
         log "DELETE: sukses $collection periode $range_label | $deleted_count dokumen dihapus | sisa=$remaining_count | durasi=$((SECONDS - step_started)) detik"
+
+        archive_progress_notify '✅ MONGODB ARCHIVE — PENGHAPUSAN BERHASIL' 5763719 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+🗑 Dokumen dihapus
+$(archive_format_count "$deleted_count") dokumen (sisa $remaining_count)
+
+🕒 Waktu penghapusan
+Mulai  : $delete_started_at
+Selesai: $delete_finished_at
+Durasi : $(format_duration "$((SECONDS - step_started))")
+
+☁️ Backup GCS
+$BACKUP_REMOTE_URI"
+
+        detail="$collection | $period_text: $(archive_format_count "$expected_count") dok, $(human_bytes "$artifact_bytes"), dihapus $delete_finished_at"
     else
         log "DELETE: nonaktif (--backup); data MongoDB tidak dihapus untuk $collection periode $range_label"
+        detail="$collection | $period_text: $(archive_format_count "$expected_count") dok, $(human_bytes "$artifact_bytes"), tidak dihapus"
     fi
 
     archive_ranges_backed_up=$((archive_ranges_backed_up + 1))
     archive_documents_backed_up=$((archive_documents_backed_up + expected_count))
+    archive_period_details+=("$detail")
     rm -f -- "$artifact" "$artifact.sha256" "$query_file"
     log "DONE: $collection periode $range_label | $expected_count dokumen | $((SECONDS - range_started)) detik total"
+    archive_current_period=''
+    archive_current_step=''
 }
 
 process_year() {
@@ -812,36 +1600,73 @@ if [[ $MONGO_ARCHIVE_YEARS != auto ]]; then
     (( ${#explicit_years[@]} > 0 )) || die "MONGO_ARCHIVE_YEARS kosong"
 fi
 
+if [[ $mode == delete ]]; then
+    last_allowed_year=$((10#$current_year - 1))
+else
+    last_allowed_year=$((10#$current_year))
+fi
+
 for index in "${!collections[@]}"; do
     collection=${collections[$index]}
     date_field=${date_fields[$index]}
+    archive_current_period="${MONGO_ARCHIVE_DATABASE}.${collection} | pemeriksaan awal"
+    archive_current_step=INSPECT
 
-    if [[ $MONGO_ARCHIVE_YEARS == auto ]]; then
-        export ARCHIVE_COLLECTION=$collection
-        export ARCHIVE_DATE_FIELD=$date_field
-        log "CHECK: mencari tahun tersedia untuk $collection (mode auto)"
-        years_output=$(run_mongosh_with_progress "daftar tahun $collection" \
-            "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
-            || die "Gagal mencari tahun pada $collection"
-        mapfile -t available_years < <(
-            awk -F '\t' '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ {print $2}' \
-                <<<"$years_output" | sort -nu
-        )
-        years=()
-        for year in "${available_years[@]}"; do
-            if (( 10#$year < 10#$current_year )) \
-               || [[ $mode == backup && $year == "$current_year" ]]; then
-                years+=("$year")
-            fi
-        done
-    else
-        years=("${explicit_years[@]}")
-    fi
-
-    if (( ${#years[@]} == 0 )); then
-        log "Tidak ada tahun yang boleh diproses untuk collection $collection"
+    # 1. Collection ada dan berisi data?
+    log "CHECK: memeriksa collection $collection (field: $date_field)"
+    inspect_collection "$collection" "$date_field"
+    case $collection_state in
+        MISSING)
+            skip_collection "$collection" "collection tidak ada di database $MONGO_ARCHIVE_DATABASE"
+            continue
+            ;;
+        NOT_COLLECTION)
+            skip_collection "$collection" "bukan collection biasa ($collection_type)"
+            continue
+            ;;
+    esac
+    if (( collection_estimated == 0 )); then
+        skip_collection "$collection" "collection kosong"
         continue
     fi
+    log "CHECK: $collection ±$collection_estimated dokumen | index=$collection_index | ttl=$collection_ttl"
+
+    # 2. Index field archive; dibuat dulu jika belum ada.
+    ensure_date_index "$collection" "$date_field"
+
+    # 3. Tahun kandidat, lalu saring hanya yang benar-benar berisi data.
+    archive_current_step=YEAR_CHECK
+    candidate_years=()
+    if [[ $MONGO_ARCHIVE_YEARS == auto ]]; then
+        first_year=$(oldest_year "$collection" "$date_field") \
+            || die "Gagal mencari data tertua pada $collection"
+        if [[ -z $first_year ]]; then
+            skip_collection "$collection" "tidak ada data BSON Date pada field $date_field"
+            continue
+        fi
+        for (( year = 10#$first_year; year <= last_allowed_year; year++ )); do
+            candidate_years+=("$year")
+        done
+    else
+        candidate_years=("${explicit_years[@]}")
+    fi
+
+    if (( ${#candidate_years[@]} == 0 )); then
+        skip_collection "$collection" "tidak ada tahun yang boleh diproses (data tertua $first_year)"
+        continue
+    fi
+
+    filter_years_with_data "$collection" "$date_field" "${candidate_years[@]}"
+    if (( ${#years_with_data[@]} == 0 )); then
+        skip_collection "$collection" "tidak ada data di tahun $(IFS=,; printf '%s' "${candidate_years[*]}") (field $date_field)"
+        continue
+    fi
+    years=("${years_with_data[@]}")
+    log "CHECK: $collection berisi data di tahun $(IFS=,; printf '%s' "${years[*]}")"
+
+    collection_docs_before=$archive_documents_backed_up
+    collection_deleted_before=$archive_documents_deleted
+    collection_ranges_before=$archive_ranges_backed_up
 
     for year in "${years[@]}"; do
         log "YEAR: mulai $collection tahun $year | chunk=$MONGO_ARCHIVE_CHUNK"
@@ -849,7 +1674,15 @@ for index in "${!collections[@]}"; do
         process_year "$collection" "$date_field" "$year"
         log "YEAR: selesai $collection tahun $year | durasi=$((SECONDS - year_started)) detik"
     done
+
+    collection_line="✅ $collection ($(IFS=,; printf '%s' "${years[*]}")): $((archive_ranges_backed_up - collection_ranges_before)) periode, $(archive_format_count "$((archive_documents_backed_up - collection_docs_before))") dok di-backup"
+    if [[ $mode == delete ]]; then
+        collection_line+=", $(archive_format_count "$((archive_documents_deleted - collection_deleted_before))") dok dihapus"
+    fi
+    archive_collection_status+=("$collection_line")
 done
+archive_current_period=''
+archive_current_step=''
 
 log "SUMMARY: mode=--$mode | periode dicek=$archive_ranges_checked | kosong=$archive_ranges_empty | di-backup=$archive_ranges_backed_up | dokumen di-backup=$archive_documents_backed_up | dokumen dihapus=$archive_documents_deleted | durasi=$((SECONDS - archive_run_started)) detik"
 if [[ $mode == delete ]]; then
