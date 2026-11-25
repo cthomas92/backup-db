@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
-# Archive data MongoDB lama ke GCS per rentang waktu, lalu hapus hanya setelah
-# backup, checksum, upload, dan verifikasi berhasil.
+# Archive data MongoDB lama ke GCS per rentang waktu. Mode --delete tetap
+# menghapus hanya setelah backup terverifikasi; --delete-only adalah aksi
+# terpisah dengan konfirmasi dan daftar tahun terlindungi tersendiri.
 # Optimized v2: aggregation boundary; index-aware batched purge; guarded delete.
 # Fail-closed if dump, verification, or GCS upload fails.
 # Tidak menyentuh lib/common.bash dan format archive/GCS existing.
@@ -19,7 +20,9 @@ usage() {
     printf '  %s --check-years [/.env]\n' "$0"
     printf '  %s --backup [/.env]\n' "$0"
     printf '  %s --delete [/.env]\n' "$0"
+    printf '  %s --delete-only [/.env]\n' "$0"
     printf '\nTahun selalu dibaca dari MONGO_ARCHIVE_YEARS di .env.\n'
+    printf 'Khusus --delete-only: gunakan daftar tahun atau all; auto ditolak.\n'
 }
 
 case $# in
@@ -33,6 +36,9 @@ case $# in
                 ;;
             --delete)
                 mode=delete
+                ;;
+            --delete-only)
+                mode=delete-only
                 ;;
             --help|-h)
                 (( $# == 1 )) || { usage >&2; exit 2; }
@@ -54,7 +60,7 @@ case $# in
         ;;
 esac
 
-if [[ $mode == check-years ]]; then
+if [[ $mode == check-years || $mode == delete-only ]]; then
     export BACKUP_SUPPRESS_STANDALONE_NOTIFY=1
 fi
 
@@ -68,10 +74,13 @@ case $mode in
     delete)
         MONGO_ARCHIVE_DELETE_AFTER_UPLOAD=true
         ;;
+    delete-only)
+        MONGO_ARCHIVE_DELETE_AFTER_UPLOAD=false
+        ;;
 esac
 
-if [[ $mode == check-years ]]; then
-    # Pemeriksaan tahun tidak memerlukan aktivasi service account GCS.
+if [[ $mode == check-years || $mode == delete-only ]]; then
+    # Pemeriksaan tahun dan delete-only tidak mengakses GCS.
     GCP_SERVICE_ACCOUNT_FILE=''
 fi
 
@@ -79,7 +88,7 @@ for command in mongosh grep awk sort date; do
     need "$command"
 done
 
-if [[ $mode != check-years ]]; then
+if [[ $mode == backup || $mode == delete ]]; then
     for command in mongodump mongorestore gzip df wc; do
         need "$command"
     done
@@ -109,6 +118,7 @@ fi
 : "${MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL:=3}"
 # Buat index {field_tanggal: 1} otomatis jika collection belum punya index
 # yang bisa dipakai untuk field archive (hanya pada --backup/--delete).
+# --delete-only tidak pernah membuat index atau perubahan lain selain delete.
 : "${MONGO_ARCHIVE_AUTO_CREATE_INDEX:=true}"
 
 validate_bool_setting() {
@@ -157,13 +167,13 @@ done
     || die "MONGO_ARCHIVE_NOTIFY_MIN_INTERVAL harus 0-60"
 
 # Validasi target GCS sebelum membuat atau menghapus backup apa pun.
-if [[ $mode != check-years ]]; then
+if [[ $mode == backup || $mode == delete ]]; then
     required GCS_URI
     [[ $GCS_URI == gs://*/*/ && $GCS_URI != *' '* ]] \
         || die "GCS_URI harus berbentuk gs://nama-bucket/path/ dan diakhiri /"
 fi
 
-if [[ $mode != check-years ]]; then
+if [[ $mode == backup || $mode == delete ]]; then
     # Tampung dulu output --help: "cmd | grep -q" + pipefail bisa gagal acak
     # karena SIGPIPE saat grep berhenti lebih awal.
     restore_help=$(mongorestore --help 2>&1 || true)
@@ -219,22 +229,87 @@ done
 
 current_year=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date +%Y)
 
-if [[ $mode == delete ]]; then
+delete_only_protected_years=()
+
+year_is_delete_only_protected() {
+    local candidate=$1
+    local protected_year
+
+    for protected_year in "${delete_only_protected_years[@]}"; do
+        [[ $candidate != "$protected_year" ]] || return 0
+    done
+    return 1
+}
+
+parse_delete_only_protected_years() {
+    local raw=$1
+    local token
+    local start_year
+    local end_year
+    local year
+    local -a tokens=()
+
+    IFS=',' read -r -a tokens <<<"$raw"
+    for token in "${tokens[@]}"; do
+        token="${token#"${token%%[![:space:]]*}"}"
+        token="${token%"${token##*[![:space:]]}"}"
+
+        if [[ $token == current ]]; then
+            start_year=$current_year
+            end_year=$current_year
+        elif [[ $token =~ ^([0-9]{4})-(current|[0-9]{4})$ ]]; then
+            start_year=${BASH_REMATCH[1]}
+            if [[ ${BASH_REMATCH[2]} == current ]]; then
+                end_year=$current_year
+            else
+                end_year=${BASH_REMATCH[2]}
+            fi
+        elif [[ $token =~ ^[0-9]{4}$ ]]; then
+            start_year=$token
+            end_year=$token
+        else
+            die "Format MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS tidak valid: $token"
+        fi
+
+        (( 10#$start_year <= 10#$end_year )) \
+            || die "Rentang tahun terlindungi terbalik: $token"
+        (( 10#$end_year - 10#$start_year <= 200 )) \
+            || die "Rentang tahun terlindungi terlalu lebar: $token"
+
+        for (( year = 10#$start_year; year <= 10#$end_year; year++ )); do
+            delete_only_protected_years+=("$year")
+        done
+    done
+
+    mapfile -t delete_only_protected_years < <(
+        printf '%s\n' "${delete_only_protected_years[@]}" | sort -nu
+    )
+    (( ${#delete_only_protected_years[@]} > 0 )) \
+        || die "MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS tidak boleh kosong"
+}
+
+if [[ $mode == delete || $mode == delete-only ]]; then
     required MONGO_ARCHIVE_DELETE_USER
     required MONGO_ARCHIVE_DELETE_PASSWORD
-    required MONGO_ARCHIVE_DELETE_CONFIRM
 
     confirmation_targets=()
     for collection_name in "${collections[@]}"; do
         confirmation_targets+=("${MONGO_ARCHIVE_DATABASE}.${collection_name}")
     done
-    expected_confirmation="DELETE $(IFS=,; printf '%s' "${confirmation_targets[*]}")"
-    [[ $MONGO_ARCHIVE_DELETE_CONFIRM == "$expected_confirmation" ]] \
-        || die "MONGO_ARCHIVE_DELETE_CONFIRM harus persis: $expected_confirmation"
 
     if ! bool_value "$MONGO_ARCHIVE_OLD_DATA_IMMUTABLE" \
        && ! bool_value "$MONGO_ARCHIVE_WRITES_PAUSED"; then
         die "Untuk menghapus, set MONGO_ARCHIVE_OLD_DATA_IMMUTABLE=true atau hentikan write lalu set MONGO_ARCHIVE_WRITES_PAUSED=true"
+    fi
+
+    if [[ $mode == delete ]]; then
+        required MONGO_ARCHIVE_DELETE_CONFIRM
+        expected_confirmation="DELETE $(IFS=,; printf '%s' "${confirmation_targets[*]}")"
+        [[ $MONGO_ARCHIVE_DELETE_CONFIRM == "$expected_confirmation" ]] \
+            || die "MONGO_ARCHIVE_DELETE_CONFIRM harus persis: $expected_confirmation"
+    else
+        required MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS
+        parse_delete_only_protected_years "$MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS"
     fi
 elif [[ $mode == backup ]]; then
     log "Mode --backup: data MongoDB tidak akan dihapus"
@@ -269,6 +344,7 @@ archive_started_at=''
 archive_ranges_checked=0
 archive_ranges_empty=0
 archive_ranges_backed_up=0
+archive_ranges_deleted=0
 archive_documents_backed_up=0
 archive_documents_deleted=0
 archive_bytes_uploaded=0
@@ -322,6 +398,9 @@ archive_mode_text() {
     case $mode in
         delete)
             printf -- '--delete (backup, upload, lalu hapus)'
+            ;;
+        delete-only)
+            printf -- '--delete-only (hapus tanpa backup)'
             ;;
         *)
             printf -- '--backup (tanpa hapus data)'
@@ -415,6 +494,8 @@ archive_send_summary() {
         bool_value "${NOTIFY_ON_SUCCESS:-true}" || return 0
         if [[ $mode == delete ]]; then
             title='✅ MONGODB ARCHIVE SELESAI — RINGKASAN'
+        elif [[ $mode == delete-only ]]; then
+            title='✅ MONGODB DELETE-ONLY SELESAI — RINGKASAN'
         else
             title='✅ MONGODB BACKUP ARCHIVE SELESAI — RINGKASAN'
         fi
@@ -460,9 +541,12 @@ Index dibuat       : $(archive_format_count "$archive_indexes_created")
 Periode dicek      : $(archive_format_count "$archive_ranges_checked")
 Periode kosong     : $(archive_format_count "$archive_ranges_empty")
 Periode di-backup  : $(archive_format_count "$archive_ranges_backed_up")
+Periode dihapus    : $(archive_format_count "$archive_ranges_deleted")
 Dokumen di-backup  : $(archive_format_count "$archive_documents_backed_up")
-Dokumen dihapus    : $(archive_format_count "$archive_documents_deleted")
-Total ukuran upload: $(human_bytes "$archive_bytes_uploaded")"
+Dokumen dihapus    : $(archive_format_count "$archive_documents_deleted")"
+    if [[ $mode != delete-only ]]; then
+        message+=$'\n'"Total ukuran upload: $(human_bytes "$archive_bytes_uploaded")"
+    fi
 
     # Batasi panjang rincian agar muat di Telegram/Discord (maks ~4096 karakter).
     for line in "${archive_period_details[@]}"; do
@@ -480,10 +564,15 @@ Total ukuran upload: $(human_bytes "$archive_bytes_uploaded")"
         fi
     fi
 
-    message+=$'\n\n'"☁️ GCS
-${GCS_URI}mongodb/archive/${safe_db}/
+    if [[ $mode == delete-only ]]; then
+        message+=$'\n\n'"⚠️ Backup
+Tidak dibuat; mode delete-only"
+    else
+        message+=$'\n\n'"☁️ GCS
+${GCS_URI}mongodb/archive/${safe_db}/"
+    fi
 
-⏱ Durasi
+    message+=$'\n\n'"⏱ Durasi
 $(format_duration "$((SECONDS - archive_run_started))")
 
 🕒 Mulai
@@ -534,7 +623,7 @@ archive_return_status() {
     return "$1"
 }
 
-if [[ $mode == check-years ]]; then
+if [[ $mode == check-years || $mode == delete-only ]]; then
     secure_dir "$BACKUP_DIR"
     exec 9>"$BACKUP_DIR/.${ENGINE}-${BACKUP_NAME}.lock"
     flock -n 9 || die "Archive atau pemeriksaan tahun masih berjalan"
@@ -542,7 +631,14 @@ if [[ $mode == check-years ]]; then
     RUN_DIR=$(mktemp -d "$BACKUP_DIR/.${ENGINE}-${BACKUP_NAME}-${STAMP}.XXXXXX")
     trap 'exit 130' INT
     trap 'exit 143' TERM HUP
-    log "Pemeriksaan tahun MongoDB (read-only)"
+    if [[ $mode == check-years ]]; then
+        log "Pemeriksaan tahun MongoDB (read-only)"
+    else
+        BACKUP_FILE_SERVER=$(backup_file_server_name)
+        archive_started_at=$(archive_now)
+        trap archive_finalize EXIT
+        log "DELETE-ONLY: hapus data MongoDB tanpa membuat backup atau mengakses GCS"
+    fi
 else
     begin_backup
     archive_started_at=$(archive_now)
@@ -552,11 +648,13 @@ fi
 # Tampilkan sasaran yang benar-benar dibaca dari .env (tanpa kredensial).
 collection_summary=$(IFS=,; printf '%s' "${collection_specs[*]}")
 log "CONFIG: mode=--$mode | db=$MONGO_ARCHIVE_DATABASE | collections=$collection_summary | years=${MONGO_ARCHIVE_YEARS:-auto} | chunk=$MONGO_ARCHIVE_CHUNK | timezone=$MONGO_ARCHIVE_TIMEZONE"
-if [[ $mode != check-years ]]; then
+if [[ $mode == backup || $mode == delete ]]; then
     log "CONFIG: GCS=${GCS_URI}mongodb/archive/${MONGO_ARCHIVE_DATABASE}/... | batch=$MONGO_ARCHIVE_DELETE_BATCH_SIZE"
 fi
 if [[ $mode == delete ]]; then
     log "DELETE_GUARD: immutable=$MONGO_ARCHIVE_OLD_DATA_IMMUTABLE | writes_paused=$MONGO_ARCHIVE_WRITES_PAUSED | target=$MONGO_ARCHIVE_DELETE_CONFIRM"
+elif [[ $mode == delete-only ]]; then
+    log "DELETE_ONLY_GUARD: immutable=$MONGO_ARCHIVE_OLD_DATA_IMMUTABLE | writes_paused=$MONGO_ARCHIVE_WRITES_PAUSED | protected=$MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS"
 fi
 
 host_arg="$MONGO_HOST:$MONGO_PORT"
@@ -568,7 +666,7 @@ shell_connection=(--quiet --norc --host "$host_arg")
 dump_connection=()
 restore_connection=()
 
-if [[ $mode != check-years ]]; then
+if [[ $mode == backup || $mode == delete ]]; then
     mongo_config="$RUN_DIR/mongodb.yml"
     TEMP_CREDENTIAL_FILE=$mongo_config
     printf 'password: "%s"\n' "$(escape_quoted_value "$MONGO_PASSWORD")" >"$mongo_config"
@@ -1104,6 +1202,25 @@ filter_years_with_data() {
     )
 }
 
+# Isi all_collection_years dengan seluruh tahun BSON Date yang ditemukan.
+# Dipakai hanya untuk permintaan delete-only yang eksplisit memakai "all".
+find_all_collection_years() {
+    local collection=$1
+    local date_field=$2
+    local output
+
+    export ARCHIVE_COLLECTION=$collection
+    export ARCHIVE_DATE_FIELD=$date_field
+    output=$(run_mongosh_with_progress "daftar seluruh tahun $collection" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$list_years_js") \
+        || die "Gagal membaca seluruh tahun pada $collection"
+
+    mapfile -t all_collection_years < <(
+        awk -F '\t' '$1 == "ARCHIVE_YEAR" && $2 ~ /^[0-9]{4}$/ {print $2}' \
+            <<<"$output" | sort -nu
+    )
+}
+
 # Tahun paling tua (zona MONGO_ARCHIVE_TIMEZONE) yang punya BSON Date; kosong jika tidak ada.
 oldest_year() {
     local collection=$1
@@ -1258,6 +1375,145 @@ check_free_space() {
     [[ $available_kb =~ ^[0-9]+$ ]] || die "Tidak dapat membaca free space BACKUP_DIR"
     (( available_kb >= required_kb )) \
         || die "Free space kurang dari ${MONGO_ARCHIVE_MIN_FREE_GB} GB; kecilkan MONGO_ARCHIVE_CHUNK"
+}
+
+delete_range_only() {
+    local collection=$1
+    local date_field=$2
+    local year=$3
+    local range_start_local=$4
+    local range_end_local=$5
+    local range_label=$6
+    local start_iso
+    local end_iso
+    local boundary_output
+    local boundary_line
+    local max_id
+    local expected_count
+    local count_output
+    local current_count
+    local delete_output
+    local deleted_count
+    local remaining_count
+    local range_started=$SECONDS
+    local step_started
+    local period_text
+    local target_text
+    local allow_shrink=0
+
+    period_text=$(archive_period_text "$range_label")
+    target_text="${MONGO_ARCHIVE_DATABASE}.${collection}"
+    archive_current_period="$target_text | $period_text"
+    archive_current_step=BOUNDARY
+    archive_ranges_checked=$((archive_ranges_checked + 1))
+
+    log "CHECK DELETE-ONLY: $collection periode $range_label | field=$date_field | rentang=$range_start_local s.d. $range_end_local (akhir eksklusif) | zona=$MONGO_ARCHIVE_TIMEZONE"
+    start_iso=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date --iso-8601=seconds -d "$range_start_local 00:00:00")
+    end_iso=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date --iso-8601=seconds -d "$range_end_local 00:00:00")
+
+    export ARCHIVE_COLLECTION=$collection
+    export ARCHIVE_DATE_FIELD=$date_field
+    export ARCHIVE_START=$start_iso
+    export ARCHIVE_END=$end_iso
+
+    step_started=$SECONDS
+    boundary_output=$(run_mongosh_with_progress "boundary delete-only $collection $range_label" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$boundary_js") \
+        || die "Gagal menentukan boundary delete-only $collection $range_label"
+
+    if grep -qx 'EMPTY' <<<"$boundary_output"; then
+        archive_ranges_empty=$((archive_ranges_empty + 1))
+        log "SKIP DELETE-ONLY: $collection periode $range_label kosong"
+        archive_current_period=''
+        archive_current_step=''
+        return 0
+    fi
+
+    boundary_line=$(awk -F '\t' '$1 == "BOUNDARY" {print; exit}' <<<"$boundary_output")
+    [[ -n $boundary_line ]] || die "Boundary delete-only tidak valid untuk $collection $range_label"
+    IFS=$'\t' read -r _ max_id expected_count <<<"$boundary_line"
+    [[ $max_id =~ ^[0-9a-fA-F]{24}$ ]] || die "ObjectId boundary tidak valid"
+    [[ $expected_count =~ ^[1-9][0-9]*$ ]] || die "Jumlah dokumen boundary tidak valid"
+    export ARCHIVE_MAX_ID=$max_id
+
+    archive_current_step=RECOUNT
+    count_output=$(run_mongosh_with_progress "recount delete-only $collection $range_label" \
+        "$MONGO_USER" "$MONGO_PASSWORD" "$MONGO_AUTH_DB" "$count_js") \
+        || die "Gagal memeriksa ulang jumlah dokumen $collection $range_label"
+    current_count=$(awk -F '\t' '$1 == "ARCHIVE_COUNT" {print $2; exit}' <<<"$count_output")
+    [[ $current_count =~ ^[0-9]+$ ]] || die "Hasil recount delete-only tidak valid"
+
+    if [[ $current_count == "$expected_count" ]]; then
+        :
+    elif [[ $collection_ttl != - ]] && (( current_count < expected_count )); then
+        allow_shrink=1
+        log "RECOUNT DELETE-ONLY: berkurang $expected_count -> $current_count karena TTL; lanjut hapus sisa"
+    else
+        die "Jumlah dokumen berubah sebelum delete-only ($expected_count menjadi $current_count); tidak ada data yang dihapus"
+    fi
+    export ARCHIVE_ALLOW_SHRINK=$allow_shrink
+
+    archive_progress_notify '🗑 MONGODB DELETE-ONLY — PROSES PENGHAPUSAN' 16705372 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+🗑 Akan dihapus
+$(archive_format_count "$current_count") dokumen
+
+⚠️ Backup
+Tidak dibuat (delete-only)
+
+🕒 Mulai
+$(archive_now)"
+
+    log "DELETE-ONLY: mulai $collection periode $range_label | $current_count dokumen | tanpa backup"
+    archive_current_step=DELETE_ONLY
+    step_started=$SECONDS
+    delete_output=$(run_mongosh_with_progress "delete-only $collection $range_label" \
+        "$MONGO_ARCHIVE_DELETE_USER" \
+        "$MONGO_ARCHIVE_DELETE_PASSWORD" \
+        "${MONGO_ARCHIVE_DELETE_AUTH_DB:-$MONGO_AUTH_DB}" \
+        "$delete_js") || die "Delete-only gagal untuk $collection $range_label"
+
+    IFS=$'\t' read -r _ deleted_count remaining_count \
+        <<<"$(awk -F '\t' '$1 == "DELETED" {print; exit}' <<<"$delete_output")"
+    [[ $deleted_count =~ ^[0-9]+$ && $remaining_count == 0 ]] \
+        || die "Verifikasi delete-only gagal untuk $collection $range_label"
+    if (( allow_shrink == 1 )); then
+        (( deleted_count <= current_count )) \
+            || die "Jumlah delete-only tidak valid untuk $collection $range_label"
+    else
+        [[ $deleted_count == "$expected_count" ]] \
+            || die "Jumlah delete-only tidak sesuai untuk $collection $range_label"
+    fi
+
+    archive_ranges_deleted=$((archive_ranges_deleted + 1))
+    archive_documents_deleted=$((archive_documents_deleted + deleted_count))
+    archive_period_details+=("$collection | $period_text: $(archive_format_count "$deleted_count") dok dihapus TANPA backup")
+    log "DELETE-ONLY: sukses $collection periode $range_label | $deleted_count dokumen dihapus | sisa=$remaining_count | durasi=$((SECONDS - step_started)) detik"
+
+    archive_progress_notify '✅ MONGODB DELETE-ONLY — PENGHAPUSAN BERHASIL' 5763719 "🗄 Collection
+$target_text
+
+📅 Periode
+$period_text
+
+🗑 Dokumen dihapus
+$(archive_format_count "$deleted_count") dokumen (sisa $remaining_count)
+
+⚠️ Backup
+Tidak dibuat (delete-only)
+
+⏱ Total periode
+$(format_duration "$((SECONDS - range_started))")
+
+🕒 Selesai
+$(archive_now)"
+
+    archive_current_period=''
+    archive_current_step=''
 }
 
 process_range() {
@@ -1509,6 +1765,7 @@ $delete_started_at"
         fi
 
         archive_documents_deleted=$((archive_documents_deleted + deleted_count))
+        archive_ranges_deleted=$((archive_ranges_deleted + 1))
         delete_finished_at=$(archive_now)
         log "DELETE: sukses $collection periode $range_label | $deleted_count dokumen dihapus | sisa=$remaining_count | durasi=$((SECONDS - step_started)) detik"
 
@@ -1544,6 +1801,14 @@ $BACKUP_REMOTE_URI"
     archive_current_step=''
 }
 
+process_selected_range() {
+    if [[ $mode == delete-only ]]; then
+        delete_range_only "$@"
+    else
+        process_range "$@"
+    fi
+}
+
 process_year() {
     local collection=$1
     local date_field=$2
@@ -1557,7 +1822,7 @@ process_year() {
 
     case "$MONGO_ARCHIVE_CHUNK" in
         year)
-            process_range "$collection" "$date_field" "$year" \
+            process_selected_range "$collection" "$date_field" "$year" \
                 "$year-01-01" "$next_year-01-01" "$year"
             ;;
 
@@ -1565,7 +1830,7 @@ process_year() {
             for month in {01..12}; do
                 start_local="$year-$month-01"
                 end_local=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date -d "$start_local +1 month" +%F)
-                process_range "$collection" "$date_field" "$year" \
+                process_selected_range "$collection" "$date_field" "$year" \
                     "$start_local" "$end_local" "$year-$month"
             done
             ;;
@@ -1574,7 +1839,7 @@ process_year() {
             cursor="$year-01-01"
             while [[ $cursor < "$next_year-01-01" ]]; do
                 next_day=$(TZ="$MONGO_ARCHIVE_TIMEZONE" date -d "$cursor +1 day" +%F)
-                process_range "$collection" "$date_field" "$year" \
+                process_selected_range "$collection" "$date_field" "$year" \
                     "$cursor" "$next_day" "$cursor"
                 cursor=$next_day
             done
@@ -1583,21 +1848,47 @@ process_year() {
 }
 
 explicit_years=()
-if [[ $MONGO_ARCHIVE_YEARS != auto ]]; then
+if [[ $mode == delete-only && $MONGO_ARCHIVE_YEARS == auto ]]; then
+    die "--delete-only tidak menerima MONGO_ARCHIVE_YEARS=auto; gunakan daftar tahun eksplisit atau all"
+fi
+if [[ $MONGO_ARCHIVE_YEARS == all ]]; then
+    [[ $mode == delete-only ]] \
+        || die "MONGO_ARCHIVE_YEARS=all hanya boleh dipakai dengan --delete-only"
+elif [[ $MONGO_ARCHIVE_YEARS != auto ]]; then
     IFS=',' read -r -a requested_years <<<"$MONGO_ARCHIVE_YEARS"
     for year in "${requested_years[@]}"; do
         year="${year#"${year%%[![:space:]]*}"}"
         year="${year%"${year##*[![:space:]]}"}"
         [[ $year =~ ^[0-9]{4}$ ]] || die "Tahun archive tidak valid: $year"
-        (( 10#$year <= 10#$current_year )) \
-            || die "Tahun mendatang $year tidak boleh diproses"
-        if [[ $mode == delete ]] && (( 10#$year == 10#$current_year )); then
-            die "Tahun berjalan $year boleh di-backup tetapi tidak boleh di-delete"
+        if [[ $mode == delete-only ]]; then
+            year_is_delete_only_protected "$year" \
+                && die "Tahun $year dilindungi oleh MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS"
+        else
+            (( 10#$year <= 10#$current_year )) \
+                || die "Tahun mendatang $year tidak boleh diproses"
+            if [[ $mode == delete ]] && (( 10#$year == 10#$current_year )); then
+                die "Tahun berjalan $year boleh di-backup tetapi tidak boleh di-delete"
+            fi
         fi
         explicit_years+=("$year")
     done
     mapfile -t explicit_years < <(printf '%s\n' "${explicit_years[@]}" | sort -nu)
     (( ${#explicit_years[@]} > 0 )) || die "MONGO_ARCHIVE_YEARS kosong"
+fi
+
+if [[ $mode == delete-only ]]; then
+    required MONGO_ARCHIVE_DELETE_ONLY_CONFIRM
+    delete_only_targets=$(IFS=,; printf '%s' "${confirmation_targets[*]}")
+    delete_only_protected=$(IFS=,; printf '%s' "${delete_only_protected_years[*]}")
+    if [[ $MONGO_ARCHIVE_YEARS == all ]]; then
+        delete_only_scope='ALL UNPROTECTED YEARS'
+    else
+        delete_only_scope="YEARS $(IFS=,; printf '%s' "${explicit_years[*]}")"
+    fi
+    expected_delete_only_confirmation="DELETE WITHOUT BACKUP $delete_only_scope FROM $delete_only_targets; PROTECTED $MONGO_ARCHIVE_DELETE_ONLY_PROTECTED_YEARS"
+    [[ $MONGO_ARCHIVE_DELETE_ONLY_CONFIRM == "$expected_delete_only_confirmation" ]] \
+        || die "MONGO_ARCHIVE_DELETE_ONLY_CONFIRM harus persis: $expected_delete_only_confirmation"
+    log "DELETE-ONLY CONFIRMED: scope=$delete_only_scope | protected=$delete_only_protected"
 fi
 
 if [[ $mode == delete ]]; then
@@ -1631,13 +1922,28 @@ for index in "${!collections[@]}"; do
     fi
     log "CHECK: $collection ±$collection_estimated dokumen | index=$collection_index | ttl=$collection_ttl"
 
-    # 2. Index field archive; dibuat dulu jika belum ada.
-    ensure_date_index "$collection" "$date_field"
+    # 2. Delete-only tidak boleh membuat index/perubahan tambahan pada DB.
+    if [[ $mode == delete-only ]]; then
+        [[ $collection_index != - ]] \
+            || die "Delete-only memerlukan index yang diawali field $date_field pada $collection; script tidak membuat index otomatis"
+        log "INDEX: delete-only memakai index $collection_index untuk $date_field"
+    else
+        ensure_date_index "$collection" "$date_field"
+    fi
 
     # 3. Tahun kandidat, lalu saring hanya yang benar-benar berisi data.
     archive_current_step=YEAR_CHECK
     candidate_years=()
-    if [[ $MONGO_ARCHIVE_YEARS == auto ]]; then
+    if [[ $MONGO_ARCHIVE_YEARS == all ]]; then
+        find_all_collection_years "$collection" "$date_field"
+        for year in "${all_collection_years[@]}"; do
+            if year_is_delete_only_protected "$year"; then
+                log "PROTECTED: $collection tahun $year tidak akan dihapus"
+            else
+                candidate_years+=("$year")
+            fi
+        done
+    elif [[ $MONGO_ARCHIVE_YEARS == auto ]]; then
         first_year=$(oldest_year "$collection" "$date_field") \
             || die "Gagal mencari data tertua pada $collection"
         if [[ -z $first_year ]]; then
@@ -1652,7 +1958,7 @@ for index in "${!collections[@]}"; do
     fi
 
     if (( ${#candidate_years[@]} == 0 )); then
-        skip_collection "$collection" "tidak ada tahun yang boleh diproses (data tertua $first_year)"
+        skip_collection "$collection" "tidak ada tahun yang boleh diproses; seluruh tahun yang ditemukan terlindungi atau kosong"
         continue
     fi
 
@@ -1667,6 +1973,7 @@ for index in "${!collections[@]}"; do
     collection_docs_before=$archive_documents_backed_up
     collection_deleted_before=$archive_documents_deleted
     collection_ranges_before=$archive_ranges_backed_up
+    collection_deleted_ranges_before=$archive_ranges_deleted
 
     for year in "${years[@]}"; do
         log "YEAR: mulai $collection tahun $year | chunk=$MONGO_ARCHIVE_CHUNK"
@@ -1675,7 +1982,11 @@ for index in "${!collections[@]}"; do
         log "YEAR: selesai $collection tahun $year | durasi=$((SECONDS - year_started)) detik"
     done
 
-    collection_line="✅ $collection ($(IFS=,; printf '%s' "${years[*]}")): $((archive_ranges_backed_up - collection_ranges_before)) periode, $(archive_format_count "$((archive_documents_backed_up - collection_docs_before))") dok di-backup"
+    if [[ $mode == delete-only ]]; then
+        collection_line="✅ $collection ($(IFS=,; printf '%s' "${years[*]}")): $((archive_ranges_deleted - collection_deleted_ranges_before)) periode, $(archive_format_count "$((archive_documents_deleted - collection_deleted_before))") dok dihapus TANPA backup"
+    else
+        collection_line="✅ $collection ($(IFS=,; printf '%s' "${years[*]}")): $((archive_ranges_backed_up - collection_ranges_before)) periode, $(archive_format_count "$((archive_documents_backed_up - collection_docs_before))") dok di-backup"
+    fi
     if [[ $mode == delete ]]; then
         collection_line+=", $(archive_format_count "$((archive_documents_deleted - collection_deleted_before))") dok dihapus"
     fi
@@ -1684,9 +1995,11 @@ done
 archive_current_period=''
 archive_current_step=''
 
-log "SUMMARY: mode=--$mode | periode dicek=$archive_ranges_checked | kosong=$archive_ranges_empty | di-backup=$archive_ranges_backed_up | dokumen di-backup=$archive_documents_backed_up | dokumen dihapus=$archive_documents_deleted | durasi=$((SECONDS - archive_run_started)) detik"
+log "SUMMARY: mode=--$mode | periode dicek=$archive_ranges_checked | kosong=$archive_ranges_empty | di-backup=$archive_ranges_backed_up | periode dihapus=$archive_ranges_deleted | dokumen di-backup=$archive_documents_backed_up | dokumen dihapus=$archive_documents_deleted | durasi=$((SECONDS - archive_run_started)) detik"
 if [[ $mode == delete ]]; then
     log "Archive dan delete selesai; tahun $current_year tetap dilindungi"
+elif [[ $mode == delete-only ]]; then
+    log "Delete-only selesai TANPA backup; tahun terlindungi: $(IFS=,; printf '%s' "${delete_only_protected_years[*]}")"
 else
     log "Backup archive selesai; tidak ada data MongoDB yang dihapus"
 fi
